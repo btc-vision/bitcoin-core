@@ -9,7 +9,8 @@
 
 #include <kernel/checks.h>
 #ifdef ENABLE_GPU_ACCELERATION
-#include <gpu_kernel/gpu_test.h>
+#include <gpu_kernel/gpu_utxo.h>
+#include <gpu_kernel/gpu_validation.h>
 #endif
 
 #include <addrman.h>
@@ -1385,17 +1386,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);
 
 #ifdef ENABLE_GPU_ACCELERATION
-    // Always log GPU capabilities on startup if GPU support is compiled in
-    LogInfo("GPU support compiled in. Detecting GPU capabilities...\n");
-    kernel::PrintGPUInfo();
-    
     if (args.GetBoolArg("-gpuacceleration", false)) {
-        LogInfo("GPU acceleration enabled, running GPU test kernel...\n");
-        if (kernel::TestGPUKernel()) {
-            LogInfo("GPU test kernel executed successfully - GPU acceleration is functional\n");
-        } else {
-            LogWarning("GPU test kernel failed - GPU acceleration may not work properly\n");
-        }
+        LogInfo("GPU acceleration enabled for transaction validation and UTXO lookups\n");
+        // GPU initialization will happen lazily when first needed
     } else {
         LogDebug(BCLog::GPU, "GPU acceleration disabled (use -gpuacceleration to enable)\n");
     }

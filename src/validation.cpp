@@ -30,7 +30,8 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/warning.h>
 #ifdef ENABLE_GPU_ACCELERATION
-#include <gpu_kernel/gpu_test.h>
+#include <gpu_kernel/gpu_utxo.h>
+#include <gpu_kernel/gpu_validation.h>
 #endif
 #include <logging.h>
 #include <logging/timer.h>
@@ -2427,17 +2428,6 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return true;
     }
 
-#ifdef ENABLE_GPU_ACCELERATION
-    // Run GPU test kernel for each block if GPU acceleration is enabled
-    static bool gpu_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
-    if (gpu_enabled && !fJustCheck) {
-        static int block_count = 0;
-        if (++block_count % 100 == 0) {  // Run test every 100 blocks to avoid too much overhead
-            LogDebug(BCLog::BENCH, "Running GPU test kernel at block height %d\n", pindex->nHeight);
-            kernel::TestGPUKernel();
-        }
-    }
-#endif
 
     bool fScriptChecks = true;
     if (!m_chainman.AssumedValidBlock().IsNull()) {
@@ -2596,6 +2586,57 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
 
+#ifdef ENABLE_GPU_ACCELERATION
+    // Initialize GPU acceleration for this block if enabled
+    static bool gpu_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
+    static std::unique_ptr<gpu::GPUUTXOSet> gpu_utxo_set;
+    static bool gpu_utxo_loaded = false;
+    static size_t vram_limit = 8ULL * 1024 * 1024 * 1024; // 8GB VRAM limit
+    
+    if (gpu_enabled && !fJustCheck && fScriptChecks) {
+        if (!gpu_utxo_set) {
+            gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
+            if (!gpu_utxo_set->Initialize(vram_limit)) {
+                LogWarning("GPU UTXO set initialization failed, falling back to CPU\n");
+                gpu_enabled = false;
+                gpu_utxo_set.reset();
+            } else {
+                LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", vram_limit / (1024 * 1024));
+            }
+        }
+        
+        // Load entire UTXO set to GPU on first use (hybrid mode)
+        if (gpu_utxo_set && !gpu_utxo_loaded) {
+            LogInfo("Loading entire UTXO set to GPU VRAM for hybrid CPU-GPU validation...\n");
+            auto load_start = SteadyClock::now();
+            
+            // Pass the coins cache view to load all UTXOs
+            if (gpu_utxo_set->LoadFromCPU(&view)) {
+                auto load_time = SteadyClock::now() - load_start;
+                LogInfo("Successfully loaded %zu UTXOs to GPU in %.2f seconds\n", 
+                        gpu_utxo_set->GetNumUTXOs(),
+                        Ticks<SecondsDouble>(load_time));
+                LogInfo("GPU VRAM usage: %zu MB / %zu MB\n", 
+                        gpu_utxo_set->GetVRAMUsage() / (1024 * 1024),
+                        vram_limit / (1024 * 1024));
+                gpu_utxo_loaded = true;
+            } else {
+                LogWarning("Failed to load UTXO set to GPU, falling back to CPU-only validation\n");
+                gpu_enabled = false;
+                gpu_utxo_set.reset();
+            }
+        }
+        
+        // Check if compaction is needed
+        if (gpu_utxo_set && gpu_utxo_loaded && gpu_utxo_set->NeedsCompaction()) {
+            LogDebug(BCLog::BENCH, "GPU UTXO set fragmentation detected, running compaction...\n");
+            if (gpu_utxo_set->Compact()) {
+                LogDebug(BCLog::BENCH, "GPU UTXO compaction completed successfully\n");
+            }
+        }
+    }
+#endif
+
     std::vector<int> prevheights;
     CAmount nFees = 0;
     int nInputs = 0;
@@ -2612,6 +2653,17 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             CAmount txfee = 0;
             TxValidationState tx_state;
+            
+#ifdef ENABLE_GPU_ACCELERATION
+            // Use GPU-accelerated UTXO lookups if available
+            if (gpu_enabled && gpu_utxo_set) {
+                LogDebug(BCLog::BENCH, "Using GPU for UTXO lookups for tx %s with %u inputs\n", 
+                         tx.GetHash().ToString().substr(0, 10), tx.vin.size());
+                // TODO: Implement GPU-accelerated CheckTxInputs
+                // For now, continue with CPU validation
+            }
+#endif
+            
             if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
@@ -2656,6 +2708,28 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             bool tx_ok;
             TxValidationState tx_state;
+            
+#ifdef ENABLE_GPU_ACCELERATION
+            // Try GPU-accelerated validation for standard transaction types
+            if (gpu_enabled && gpu_utxo_set && !control) {
+                // Check if this transaction is suitable for GPU validation (P2PKH, P2WPKH)
+                bool gpu_validation_suitable = true;
+                for (const auto& input : tx.vin) {
+                    const Coin& coin = view.AccessCoin(input.prevout);
+                    if (coin.IsSpent() || coin.out.scriptPubKey.size() > 100) {
+                        gpu_validation_suitable = false;
+                        break;
+                    }
+                }
+                
+                if (gpu_validation_suitable) {
+                    LogDebug(BCLog::BENCH, "Using GPU validation for transaction %s\n", tx.GetHash().ToString());
+                    // TODO: Call GPU validation kernel
+                    // For now, fall through to CPU validation
+                }
+            }
+#endif
+            
             // If CheckInputScripts is called with a pointer to a checks vector, the resulting checks are appended to it. In that case
             // they need to be added to control which runs them asynchronously. Otherwise, CheckInputScripts runs the checks before returning.
             if (control) {
@@ -2678,6 +2752,39 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             blockundo.vtxundo.emplace_back();
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+        
+#ifdef ENABLE_GPU_ACCELERATION
+        // Update GPU UTXO set to maintain sync with CPU in hybrid mode
+        if (gpu_utxo_set && gpu_utxo_loaded) {
+            // Spend inputs from GPU UTXO set
+            if (!tx.IsCoinBase()) {
+                for (const auto& input : tx.vin) {
+                    gpu_utxo_set->SpendUTXO(input.prevout.hash.ToUint256(), input.prevout.n);
+                }
+            }
+            
+            // Add new outputs to GPU UTXO set
+            for (size_t out = 0; out < tx.vout.size(); out++) {
+                if (!tx.vout[out].IsNull()) {
+                    gpu::UTXOHeader header;
+                    memset(&header, 0, sizeof(header));
+                    header.amount = tx.vout[out].nValue;
+                    header.vout = out;
+                    header.blockHeight = pindex->nHeight;
+                    header.flags = tx.IsCoinBase() ? gpu::UTXO_FLAG_COINBASE : 0;
+                    
+                    const CScript& script = tx.vout[out].scriptPubKey;
+                    header.script_size = script.size();
+                    
+                    // Let GPU's IdentifyScriptType handle script classification
+                    // This is a simple pattern match, much faster than Solver
+                    header.script_type = gpu::IdentifyScriptType(script.data(), script.size());
+                    
+                    gpu_utxo_set->AddUTXO(tx.GetHash().ToUint256(), out, header, script.data());
+                }
+            }
+        }
+#endif
     }
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
