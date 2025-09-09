@@ -131,6 +131,8 @@ add_executable(test_bitcoin
   $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_utxo_tests.cpp>
   $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_crypto_verification.cpp>
   $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_hash_verification_tests.cpp>
+  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_utxo_loader_tests.cpp>
+  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_utxo_loader_debug_test.cpp>
 )
 
 include(TargetDataSources)
