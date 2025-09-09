@@ -103,7 +103,9 @@ BOOST_FIXTURE_TEST_CASE(gpu_hash_test_vectors, BasicTestingSetup)
         CSHA256 sha;
         uint256 result;
         sha.Finalize(result.begin());
-        BOOST_CHECK_EQUAL(result.ToString(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        // Use HexStr directly on the bytes to get the correct byte order
+        std::vector<unsigned char> vch(result.begin(), result.end());
+        BOOST_CHECK_EQUAL(HexStr(vch), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
     
     // SHA-256 of "abc"
@@ -112,7 +114,9 @@ BOOST_FIXTURE_TEST_CASE(gpu_hash_test_vectors, BasicTestingSetup)
         sha.Write((const unsigned char*)"abc", 3);
         uint256 result;
         sha.Finalize(result.begin());
-        BOOST_CHECK_EQUAL(result.ToString(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        // Use HexStr directly on the bytes to get the correct byte order
+        std::vector<unsigned char> vch(result.begin(), result.end());
+        BOOST_CHECK_EQUAL(HexStr(vch), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
     
     // RIPEMD-160 of empty string
