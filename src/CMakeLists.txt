@@ -403,8 +403,12 @@ if(BUILD_GUI)
 endif()
 
 
-if(BUILD_KERNEL_LIB OR ENABLE_GPU_ACCELERATION)
+if(BUILD_KERNEL_LIB)
   add_subdirectory(kernel)
+endif()
+
+if(ENABLE_GPU_ACCELERATION)
+  add_subdirectory(gpu_kernel)
 endif()
 
 if(BUILD_UTIL_CHAINSTATE)

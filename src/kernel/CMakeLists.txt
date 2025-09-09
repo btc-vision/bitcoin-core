@@ -8,35 +8,6 @@ include(GNUInstallDirs)
 #       library, as more and more modules are decoupled from the
 #       consensus engine, this list will shrink to only those
 #       which are absolutely necessary.
-if(ENABLE_GPU_ACCELERATION)
-  add_library(bitcoin_kernel_gpu STATIC
-    gpu_test.cu
-    gpu_test.h
-    gpu_logging.cpp
-  )
-  
-  target_include_directories(bitcoin_kernel_gpu PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-  )
-  
-  set_target_properties(bitcoin_kernel_gpu PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    POSITION_INDEPENDENT_CODE ON
-  )
-  
-  target_compile_options(bitcoin_kernel_gpu PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-  )
-  
-  target_link_libraries(bitcoin_kernel_gpu PUBLIC
-    ${CUDA_LIBRARIES}
-    ${CUDA_CUDART_LIBRARY}
-  )
-endif()
-
 add_library(bitcoinkernel
   bitcoinkernel.cpp
   chain.cpp

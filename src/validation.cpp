@@ -30,7 +30,7 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/warning.h>
 #ifdef ENABLE_GPU_ACCELERATION
-#include <kernel/gpu_test.h>
+#include <gpu_kernel/gpu_test.h>
 #endif
 #include <logging.h>
 #include <logging/timer.h>
