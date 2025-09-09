@@ -83,6 +83,51 @@
         "WITH_USDT": "ON",
         "WITH_ZMQ": "ON"
       }
+    },
+    {
+      "name": "cuda",
+      "displayName": "Build with CUDA GPU acceleration support",
+      "binaryDir": "${sourceDir}/build_gpu",
+      "cacheVariables": {
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+        "CMAKE_CUDA_ARCHITECTURES": "50;60;70;75;80;86;89;90",
+        "ENABLE_CUDA": "ON",
+        "BUILD_DAEMON": "ON",
+        "BUILD_CLI": "ON",
+        "BUILD_TESTS": "ON",
+        "BUILD_WALLET_TOOL": "ON",
+        "ENABLE_WALLET": "ON"
+      }
+    },
+    {
+      "name": "cuda-dev",
+      "displayName": "Developer mode with CUDA GPU acceleration",
+      "binaryDir": "${sourceDir}/build_gpu_dev",
+      "errors": {"dev": true},
+      "cacheVariables": {
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+        "CMAKE_CUDA_ARCHITECTURES": "50;60;70;75;80;86;89;90",
+        "ENABLE_CUDA": "ON",
+        "BUILD_BENCH": "ON",
+        "BUILD_CLI": "ON",
+        "BUILD_DAEMON": "ON",
+        "BUILD_FUZZ_BINARY": "ON",
+        "BUILD_GUI": "ON",
+        "BUILD_GUI_TESTS": "ON",
+        "BUILD_KERNEL_LIB": "ON",
+        "BUILD_SHARED_LIBS": "ON",
+        "BUILD_TESTS": "ON",
+        "BUILD_TX": "ON",
+        "BUILD_UTIL": "ON",
+        "BUILD_UTIL_CHAINSTATE": "ON",
+        "BUILD_WALLET_TOOL": "ON",
+        "ENABLE_EXTERNAL_SIGNER": "ON",
+        "ENABLE_WALLET": "ON",
+        "ENABLE_IPC": "ON",
+        "WITH_QRENCODE": "ON",
+        "WITH_USDT": "ON",
+        "WITH_ZMQ": "ON"
+      }
     }
   ]
 }
