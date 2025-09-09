@@ -8,6 +8,9 @@
 #include <init.h>
 
 #include <kernel/checks.h>
+#ifdef ENABLE_GPU_ACCELERATION
+#include <kernel/gpu_test.h>
+#endif
 
 #include <addrman.h>
 #include <banman.h>
@@ -526,6 +529,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-shutdownnotify=<cmd>", "Execute command immediately before beginning shutdown. The need for shutdown may be urgent, so be careful not to delay it long (if the command doesn't require interaction with the server, consider having it fork into the background).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-txindex", strprintf("Maintain a full transaction index, used by the getrawtransaction rpc call (default: %u)", DEFAULT_TXINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-gpuacceleration", strprintf("Enable GPU acceleration for certain operations (default: %u)", false), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blockfilterindex=<type>",
                  strprintf("Maintain an index of compact filters by block (default: %s, values: %s).", DEFAULT_BLOCKFILTERINDEX, ListBlockFilterTypes()) +
                  " If <type> is not supplied or if <type> = 1, indexes for all known types are enabled.",
@@ -1379,6 +1383,25 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);
+
+#ifdef ENABLE_GPU_ACCELERATION
+    // Always log GPU capabilities on startup if GPU support is compiled in
+    LogInfo("GPU support compiled in. Detecting GPU capabilities...\n");
+    kernel::PrintGPUInfo();
+    
+    if (args.GetBoolArg("-gpuacceleration", false)) {
+        LogInfo("GPU acceleration enabled, running GPU test kernel...\n");
+        if (kernel::TestGPUKernel()) {
+            LogInfo("GPU test kernel executed successfully - GPU acceleration is functional\n");
+        } else {
+            LogWarning("GPU test kernel failed - GPU acceleration may not work properly\n");
+        }
+    } else {
+        LogDebug(BCLog::GPU, "GPU acceleration disabled (use -gpuacceleration to enable)\n");
+    }
+#else
+    LogDebug(BCLog::GPU, "Bitcoin Core compiled without GPU support\n");
+#endif
 
     // Warn about relative -datadir path.
     if (args.IsArgSet("-datadir") && !args.GetPathArg("-datadir").is_absolute()) {

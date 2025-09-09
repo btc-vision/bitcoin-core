@@ -9,6 +9,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <common/args.h>
 #include <checkqueue.h>
 #include <clientversion.h>
 #include <consensus/amount.h>
@@ -28,6 +29,9 @@
 #include <kernel/messagestartchars.h>
 #include <kernel/notifications_interface.h>
 #include <kernel/warning.h>
+#ifdef ENABLE_GPU_ACCELERATION
+#include <kernel/gpu_test.h>
+#endif
 #include <logging.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
@@ -2422,6 +2426,18 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             view.SetBestBlock(pindex->GetBlockHash());
         return true;
     }
+
+#ifdef ENABLE_GPU_ACCELERATION
+    // Run GPU test kernel for each block if GPU acceleration is enabled
+    static bool gpu_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
+    if (gpu_enabled && !fJustCheck) {
+        static int block_count = 0;
+        if (++block_count % 100 == 0) {  // Run test every 100 blocks to avoid too much overhead
+            LogDebug(BCLog::BENCH, "Running GPU test kernel at block height %d\n", pindex->nHeight);
+            kernel::TestGPUKernel();
+        }
+    }
+#endif
 
     bool fScriptChecks = true;
     if (!m_chainman.AssumedValidBlock().IsNull()) {

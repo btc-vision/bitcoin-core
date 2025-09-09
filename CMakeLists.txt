@@ -133,6 +133,48 @@ endif()
 
 option(ENABLE_EXTERNAL_SIGNER "Enable external signer support." ON)
 
+option(ENABLE_GPU_ACCELERATION "Enable GPU acceleration with CUDA." OFF)
+if(ENABLE_GPU_ACCELERATION)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "CUDA ${CUDAToolkit_VERSION} found")
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  
+  # Auto-detect CUDA architectures based on CUDA version
+  if (NOT CMAKE_CUDA_ARCHITECTURES)
+    if (CUDAToolkit_VERSION VERSION_LESS "11.0")
+      set(CMAKE_CUDA_ARCHITECTURES "50;52;60;61;70;75")
+    elseif (CUDAToolkit_VERSION VERSION_LESS "11.1")
+      set(CMAKE_CUDA_ARCHITECTURES "52;60;61;70;75;80")
+    elseif (CUDAToolkit_VERSION VERSION_LESS "11.8")
+      set(CMAKE_CUDA_ARCHITECTURES "52;60;61;70;75;80;86")
+    elseif (CUDAToolkit_VERSION VERSION_LESS "12.0")
+      set(CMAKE_CUDA_ARCHITECTURES "52;60;61;70;75;80;86;87;89;90")
+    else()
+      # CUDA 12.0+ dropped support for sm_50 and sm_52
+      # Include: Turing (7.5), Ampere (8.0, 8.6, 8.7), Ada Lovelace (8.9), Hopper (9.0)
+      set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;80;86;87;89;90")
+      
+      if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
+        # Hopper architecture-specific features (CC 9.0)
+        list(APPEND CMAKE_CUDA_ARCHITECTURES "90a")
+      endif()
+      
+      if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+        # Add support for Blackwell architectures
+        # 100 = Compute Capability 10.0 (GB200, B200 datacenter)
+        # 120 = Compute Capability 12.0 (RTX 50 series consumer GPUs)
+        list(APPEND CMAKE_CUDA_ARCHITECTURES "100" "120")
+        # Optionally add PTX for forward compatibility
+        # list(APPEND CMAKE_CUDA_ARCHITECTURES "120-virtual")
+      endif()
+    endif()
+    
+    message(STATUS "Auto-selected CUDA architectures based on CUDA ${CUDAToolkit_VERSION}: ${CMAKE_CUDA_ARCHITECTURES}")
+  endif()
+endif()
+
 cmake_dependent_option(WITH_QRENCODE "Enable QR code support." ON "BUILD_GUI" OFF)
 if(WITH_QRENCODE)
   find_package(QRencode MODULE REQUIRED)
@@ -222,6 +264,12 @@ if(BUILD_FOR_FUZZING)
 
   target_compile_definitions(core_interface INTERFACE
     FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+  )
+endif()
+
+if(ENABLE_GPU_ACCELERATION)
+  target_compile_definitions(core_interface INTERFACE
+    ENABLE_GPU_ACCELERATION
   )
 endif()
 
