@@ -14,7 +14,7 @@ struct cudaDeviceProp;
 
 /**
  * GPUMiningKernel class provides a high-level interface for GPU mining operations
- * This is a placeholder implementation for testing the build system
+ * Implements Bitcoin proof-of-work mining using CUDA-accelerated SHA-256d
  */
 class GPUMiningKernel {
 private:
@@ -40,12 +40,23 @@ public:
     bool CopyToGPU(void* gpu_dst, const void* host_src, size_t size);
     bool CopyFromGPU(void* host_dst, const void* gpu_src, size_t size);
 
-    // Test computation (mimics the demo kernel)
-    bool RunTestComputation(const int* input, int* output, int size);
+    // Main mining interface
+    bool Mine(const uint8_t* block_header, const uint8_t* target,
+              uint32_t start_nonce, uint32_t nonce_range,
+              uint32_t* found_nonce, uint8_t* found_hash);
+    
+    // Multi-GPU mining support
+    bool MineMultiGPU(const uint8_t* block_header, const uint8_t* target,
+                      uint32_t start_nonce, uint32_t total_range,
+                      uint32_t* found_nonce, uint8_t* found_hash);
 
-    // Future mining-specific functions would go here
-    // bool ComputeHash(const uint8_t* block_header, uint8_t* hash_output);
-    // bool SearchNonce(const uint8_t* block_header, uint32_t* nonce, uint32_t target);
+    // Compatibility methods (deprecated - use Mine() instead)
+    bool RunTestComputation(const int* input, int* output, int size);
+    bool ComputeBlockHashes(const uint8_t* block_header, uint32_t start_nonce, 
+                            uint32_t num_hashes, uint32_t* nonces, uint8_t* hashes);
+    bool SearchForValidNonce(const uint8_t* block_header, const uint32_t* target,
+                             uint32_t start_nonce, uint32_t range, 
+                             uint32_t* found_nonce, uint8_t* found_hash);
 };
 
 #endif // BITCOIN_GPU_KERNEL_GPU_MINING_H

@@ -9,6 +9,16 @@ if(ENABLE_GPU_ACCELERATION)
     gpu_logging.cpp
     gpu_mining.cu
     gpu_mining.h
+    gpu_hash.cuh
+    gpu_hash_test_kernels.cu
+    gpu_utxo.cu
+    gpu_utxo.h
+    gpu_cuckoo.cu
+    gpu_utxo_loader.cu
+    gpu_utxo_loader_wrapper.cpp
+    gpu_utxo_compact.cu
+    gpu_validation.cu
+    gpu_utxo_wrapper.cpp
   )
   
   target_include_directories(bitcoin_kernel_gpu PUBLIC
@@ -23,8 +33,13 @@ if(ENABLE_GPU_ACCELERATION)
     POSITION_INDEPENDENT_CODE ON
   )
   
+  set_target_properties(bitcoin_kernel_gpu PROPERTIES
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+  )
+  
   target_compile_options(bitcoin_kernel_gpu PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -UNDEBUG --std=c++20>
   )
   
   target_link_libraries(bitcoin_kernel_gpu PUBLIC
