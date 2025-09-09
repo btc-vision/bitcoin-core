@@ -7,6 +7,8 @@ if(ENABLE_GPU_ACCELERATION)
     gpu_test.cu
     gpu_test.h
     gpu_logging.cpp
+    gpu_mining.cu
+    gpu_mining.h
   )
   
   target_include_directories(bitcoin_kernel_gpu PUBLIC

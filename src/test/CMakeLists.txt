@@ -127,6 +127,7 @@ add_executable(test_bitcoin
   validation_tests.cpp
   validationinterface_tests.cpp
   versionbits_tests.cpp
+  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_kernel_tests.cpp>
 )
 
 include(TargetDataSources)
@@ -157,6 +158,7 @@ target_link_libraries(test_bitcoin
   secp256k1
   Boost::headers
   libevent::extra
+  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:bitcoin_kernel_gpu>
 )
 
 if(ENABLE_WALLET)

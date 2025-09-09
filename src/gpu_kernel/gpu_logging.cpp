@@ -1,7 +1,25 @@
 #include "gpu_test.h"
+#include "gpu_logging.h"
 #include <logging.h>
 #include <cstdio>
 #include <string>
+
+// C-linkage functions for CUDA interop
+extern "C" {
+
+void LogGPUDebug(const char* message) {
+    kernel::LogGPUDebug(message);
+}
+
+void LogGPUInfo(const char* message) {
+    kernel::LogGPUInfo(message);
+}
+
+void LogGPUInfoFormatted(const char* format, int value) {
+    kernel::LogGPUInfoFormatted(format, value);
+}
+
+} // extern "C"
 
 namespace kernel {
 
