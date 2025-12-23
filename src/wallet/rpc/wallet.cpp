@@ -19,6 +19,7 @@
 #include <wallet/walletutil.h>
 
 #include <optional>
+#include <string_view>
 
 
 namespace wallet {
@@ -310,7 +311,7 @@ static RPCHelpMan setwalletflag()
     std::string flag_str = request.params[0].get_str();
     bool value = request.params[1].isNull() || request.params[1].get_bool();
 
-    if (!STRING_TO_WALLET_FLAG.count(flag_str)) {
+    if (!STRING_TO_WALLET_FLAG.contains(flag_str)) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Unknown wallet flag: %s", flag_str));
     }
 
@@ -335,7 +336,7 @@ static RPCHelpMan setwalletflag()
         pwallet->UnsetWalletFlag(flag);
     }
 
-    if (flag && value && WALLET_FLAG_CAVEATS.count(flag)) {
+    if (flag && value && WALLET_FLAG_CAVEATS.contains(flag)) {
         res.pushKV("warnings", WALLET_FLAG_CAVEATS.at(flag));
     }
 
@@ -456,7 +457,7 @@ static RPCHelpMan unloadwallet()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    const std::string wallet_name{EnsureUniqueWalletName(request, self.MaybeArg<std::string>("wallet_name"))};
+    const std::string wallet_name{EnsureUniqueWalletName(request, self.MaybeArg<std::string_view>("wallet_name"))};
 
     WalletContext& context = EnsureWalletContext(request.context);
     std::shared_ptr<CWallet> wallet = GetWallet(context, wallet_name);
@@ -547,10 +548,10 @@ RPCHelpMan simulaterawtransaction()
         // broadcast, we will lose everything in these
         for (const auto& txin : mtx.vin) {
             const auto& outpoint = txin.prevout;
-            if (spent.count(outpoint)) {
+            if (spent.contains(outpoint)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Transaction(s) are spending the same output more than once");
             }
-            if (new_utxos.count(outpoint)) {
+            if (new_utxos.contains(outpoint)) {
                 changes -= new_utxos.at(outpoint);
                 new_utxos.erase(outpoint);
             } else {
@@ -613,7 +614,7 @@ static RPCHelpMan migratewallet()
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
         {
-            const std::string wallet_name{EnsureUniqueWalletName(request, self.MaybeArg<std::string>("wallet_name"))};
+            const std::string wallet_name{EnsureUniqueWalletName(request, self.MaybeArg<std::string_view>("wallet_name"))};
 
             SecureString wallet_pass;
             wallet_pass.reserve(100);

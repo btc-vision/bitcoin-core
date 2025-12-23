@@ -25,6 +25,8 @@ add_executable(test_bitcoin
   blockmanager_tests.cpp
   bloom_tests.cpp
   bswap_tests.cpp
+  caches_tests.cpp
+  chain_tests.cpp
   chainstate_write_tests.cpp
   checkqueue_tests.cpp
   cluster_linearize_tests.cpp
@@ -32,7 +34,6 @@ add_executable(test_bitcoin
   coinscachepair_tests.cpp
   coinstatsindex_tests.cpp
   common_url_tests.cpp
-  compilerbug_tests.cpp
   compress_tests.cpp
   crypto_tests.cpp
   cuckoocache_tests.cpp
@@ -41,6 +42,7 @@ add_executable(test_bitcoin
   descriptor_tests.cpp
   disconnected_transactions.cpp
   feefrac_tests.cpp
+  feerounder_tests.cpp
   flatfile_tests.cpp
   fs_tests.cpp
   getarg_tests.cpp
@@ -70,7 +72,6 @@ add_executable(test_bitcoin
   pcp_tests.cpp
   peerman_tests.cpp
   pmt_tests.cpp
-  policy_fee_tests.cpp
   policyestimator_tests.cpp
   pool_tests.cpp
   pow_tests.cpp
@@ -101,6 +102,7 @@ add_executable(test_bitcoin
   span_tests.cpp
   streams_tests.cpp
   sync_tests.cpp
+  system_ram_tests.cpp
   system_tests.cpp
   testnet4_miner_tests.cpp
   timeoffsets_tests.cpp
@@ -116,6 +118,8 @@ add_executable(test_bitcoin
   txvalidation_tests.cpp
   txvalidationcache_tests.cpp
   uint256_tests.cpp
+  util_check_tests.cpp
+  util_expected_tests.cpp
   util_string_tests.cpp
   util_tests.cpp
   util_threadnames_tests.cpp
@@ -171,18 +175,7 @@ if(ENABLE_WALLET)
 endif()
 
 if(ENABLE_IPC)
-  target_link_libraries(bitcoin_ipc_test
-    PRIVATE
-      core_interface
-      univalue
-      Boost::headers
-  )
-
-  target_sources(test_bitcoin
-    PRIVATE
-      ipc_tests.cpp
-  )
-  target_link_libraries(test_bitcoin bitcoin_ipc_test bitcoin_ipc)
+  add_subdirectory(${PROJECT_SOURCE_DIR}/src/ipc/test ipc)
 endif()
 
 function(add_boost_test source_file)
@@ -203,7 +196,10 @@ function(add_boost_test source_file)
       COMMAND test_bitcoin --run_test=${test_suite_name} --catch_system_error=no --log_level=test_suite -- DEBUG_LOG_OUT
     )
     set_property(TEST ${test_suite_name} PROPERTY
-      SKIP_REGULAR_EXPRESSION "no test cases matching filter" "skipping script_assets_test"
+      SKIP_REGULAR_EXPRESSION
+        "no test cases matching filter"
+        "skipping script_assets_test"
+        "skipping total_ram"
     )
   endforeach()
 endfunction()

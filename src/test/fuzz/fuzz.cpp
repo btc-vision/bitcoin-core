@@ -51,7 +51,7 @@ static std::vector<const char*> g_args;
 static void SetArgs(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         // Only take into account arguments that start with `--`. The others are for the fuzz engine:
-        // `fuzz -runs=1 fuzz_corpora/address_deserialize_v2 --checkaddrman=5`
+        // `fuzz -runs=1 fuzz_corpora/address_deserialize --checkaddrman=5`
         if (strlen(argv[i]) > 2 && argv[i][0] == '-' && argv[i][1] == '-') {
             g_args.push_back(argv[i]);
         }
@@ -75,7 +75,7 @@ auto& FuzzTargets()
 
 void FuzzFrameworkRegisterTarget(std::string_view name, TypeTestOneInput target, FuzzTargetOptions opts)
 {
-    const auto [it, ins]{FuzzTargets().try_emplace(name, FuzzTarget /* temporary can be dropped after Apple-Clang-16 ? */ {std::move(target), std::move(opts)})};
+    const auto [it, ins]{FuzzTargets().try_emplace(name, std::move(target), std::move(opts))};
     Assert(ins);
 }
 

@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2022 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -62,6 +62,12 @@ const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
 } // namespace DBKeys
+
+void LogDBInfo()
+{
+    // Add useful DB information here. This will be printed during startup.
+    LogInfo("Using SQLite Version %s", SQLiteDatabaseVersion());
+}
 
 //
 // WalletBatch
@@ -403,7 +409,7 @@ bool LoadEncryptionKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue,
         ssKey >> nID;
         CMasterKey kMasterKey;
         ssValue >> kMasterKey;
-        if(pwallet->mapMasterKeys.count(nID) != 0)
+        if(pwallet->mapMasterKeys.contains(nID))
         {
             strErr = strprintf("Error reading wallet database: duplicate CMasterKey id %u", nID);
             return false;

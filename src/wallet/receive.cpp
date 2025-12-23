@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 The Bitcoin Core developers
+// Copyright (c) 2021-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -195,7 +195,10 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
 
 bool CachedTxIsFromMe(const CWallet& wallet, const CWalletTx& wtx)
 {
-    return (CachedTxGetDebit(wallet, wtx, /*avoid_reuse=*/false) > 0);
+    if (!wtx.m_cached_from_me.has_value()) {
+        wtx.m_cached_from_me = wallet.IsFromMe(*wtx.tx);
+    }
+    return wtx.m_cached_from_me.value();
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
@@ -224,7 +227,7 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx, std::set<Txi
         // Check that this specific input being spent is trusted
         if (!wallet.IsMine(parentOut)) return false;
         // If we've already trusted this parent, continue
-        if (trusted_parents.count(parent->GetHash())) continue;
+        if (trusted_parents.contains(parent->GetHash())) continue;
         // Recurse to check that the parent is also trusted
         if (!CachedTxIsTrusted(wallet, *parent, trusted_parents)) return false;
         trusted_parents.insert(parent->GetHash());

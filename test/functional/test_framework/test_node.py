@@ -48,7 +48,12 @@ BITCOIND_PROC_WAIT_TIMEOUT = 60
 # The size of the blocks xor key
 # from InitBlocksdirXorKey::xor_key.size()
 NUM_XOR_BYTES = 8
-CLI_MAX_ARG_SIZE = 131071 # many systems have a 128kb limit per arg (MAX_ARG_STRLEN)
+# Many systems have a 128kB limit for a command size. Depending on the
+# platform, this limit may be larger or smaller. Moreover, when using the
+# 'bitcoin' command, it may internally insert more args, which must be
+# accounted for. There is no need to pick the largest possible value here
+# anyway and it should be fine to set it to 1kB in tests.
+TEST_CLI_MAX_ARG_SIZE = 1024
 
 # The null blocks key (all 0s)
 NULL_BLK_XOR_KEY = bytes([0] * NUM_XOR_BYTES)
@@ -101,7 +106,8 @@ class TestNode():
         self.stderr_dir = self.datadir_path / "stderr"
         self.chain = chain
         self.rpchost = rpchost
-        self.rpc_timeout = timewait
+        self.rpc_timeout = timewait  # Already multiplied by timeout_factor
+        self.timeout_factor = timeout_factor
         self.binaries = binaries
         self.coverage_dir = coverage_dir
         self.cwd = cwd
@@ -156,7 +162,7 @@ class TestNode():
             self.args.append("-logsourcelocations")
         if self.version_is_at_least(239000):
             self.args.append("-loglevel=trace")
-        if self.version_is_at_least(299900):
+        if self.version_is_at_least(290100):
             self.args.append("-nologratelimit")
 
         # Default behavior from global -v2transport flag is added to args to persist it over restarts.
@@ -170,7 +176,11 @@ class TestNode():
                 self.args.append("-v2transport=0")
         # if v2transport is requested via global flag but not supported for node version, ignore it
 
-        self.cli = TestNodeCLI(binaries, self.datadir_path)
+        self.cli = TestNodeCLI(
+            binaries,
+            self.datadir_path,
+            self.rpc_timeout // 2,  # timeout identical to the one used in self._rpc
+        )
         self.use_cli = use_cli
         self.start_perf = start_perf
 
@@ -185,7 +195,6 @@ class TestNode():
         self.perf_subprocesses = {}
 
         self.p2ps = []
-        self.timeout_factor = timeout_factor
 
         self.mocktime = None
 
@@ -354,10 +363,15 @@ class TestNode():
                 latest_error = suppress_error(f"JSONRPCException {e.error['code']}", e)
             except OSError as e:
                 error_num = e.errno
-                # Work around issue where socket timeouts don't have errno set.
-                # https://github.com/python/cpython/issues/109601
-                if error_num is None and isinstance(e, TimeoutError):
-                    error_num = errno.ETIMEDOUT
+                if error_num is None:
+                    # Work around issue where socket timeouts don't have errno set.
+                    # https://github.com/python/cpython/issues/109601
+                    if isinstance(e, TimeoutError):
+                        error_num = errno.ETIMEDOUT
+                    # http.client.RemoteDisconnected inherits from this type and
+                    # doesn't specify errno.
+                    elif isinstance(e, ConnectionResetError):
+                        error_num = errno.ECONNRESET
 
                 # Suppress similarly to the above JSONRPCException errors.
                 if error_num not in [
@@ -497,13 +511,13 @@ class TestNode():
         The substitutions are passed as a list of search-replace-tuples, e.g.
             [("old", "new"), ("foo", "bar"), ...]
         """
-        with open(self.bitcoinconf, 'r', encoding='utf8') as conf:
+        with open(self.bitcoinconf, 'r') as conf:
             conf_data = conf.read()
         for replacement in replacements:
             assert_equal(len(replacement), 2)
             old, new = replacement[0], replacement[1]
             conf_data = conf_data.replace(old, new)
-        with open(self.bitcoinconf, 'w', encoding='utf8') as conf:
+        with open(self.bitcoinconf, 'w') as conf:
             conf.write(conf_data)
 
     @property
@@ -541,54 +555,54 @@ class TestNode():
             unexpected_msgs = []
         assert_equal(type(expected_msgs), list)
         assert_equal(type(unexpected_msgs), list)
+        remaining_expected = list(expected_msgs)
 
         time_end = time.time() + timeout * self.timeout_factor
         prev_size = self.debug_log_size(encoding="utf-8")  # Must use same encoding that is used to read() below
 
+        def join_log(log):
+            return " - " + "\n - ".join(log.splitlines())
+
         yield
 
         while True:
-            found = True
             with open(self.debug_log_path, encoding="utf-8", errors="replace") as dl:
                 dl.seek(prev_size)
                 log = dl.read()
-            print_log = " - " + "\n - ".join(log.splitlines())
             for unexpected_msg in unexpected_msgs:
-                if re.search(re.escape(unexpected_msg), log, flags=re.MULTILINE):
-                    self._raise_assertion_error('Unexpected message "{}" partially matches log:\n\n{}\n\n'.format(unexpected_msg, print_log))
-            for expected_msg in expected_msgs:
-                if re.search(re.escape(expected_msg), log, flags=re.MULTILINE) is None:
-                    found = False
-            if found:
+                if unexpected_msg in log:
+                    self._raise_assertion_error(f'Unexpected message "{unexpected_msg}" '
+                                                f'found in log:\n\n{join_log(log)}\n\n')
+            while remaining_expected and remaining_expected[-1] in log:
+                remaining_expected.pop()
+            if not remaining_expected:
                 return
             if time.time() >= time_end:
                 break
             time.sleep(0.05)
-        self._raise_assertion_error('Expected messages "{}" does not partially match log:\n\n{}\n\n'.format(str(expected_msgs), print_log))
+        remaining_expected = [e for e in remaining_expected if e not in log]
+        self._raise_assertion_error(f'Expected message(s) {remaining_expected!s} '
+                                    f'not found in log:\n\n{join_log(log)}\n\n')
 
     @contextlib.contextmanager
     def busy_wait_for_debug_log(self, expected_msgs, timeout=60):
         """
         Block until we see a particular debug log message fragment or until we exceed the timeout.
-        Return:
-            the number of log lines we encountered when matching
         """
         time_end = time.time() + timeout * self.timeout_factor
         prev_size = self.debug_log_size(mode="rb")  # Must use same mode that is used to read() below
+        remaining_expected = list(expected_msgs)
 
         yield
 
         while True:
-            found = True
             with open(self.debug_log_path, "rb") as dl:
                 dl.seek(prev_size)
                 log = dl.read()
 
-            for expected_msg in expected_msgs:
-                if expected_msg not in log:
-                    found = False
-
-            if found:
+            while remaining_expected and remaining_expected[-1] in log:
+                remaining_expected.pop()
+            if not remaining_expected:
                 return
 
             if time.time() >= time_end:
@@ -598,9 +612,9 @@ class TestNode():
             # No sleep here because we want to detect the message fragment as fast as
             # possible.
 
-        self._raise_assertion_error(
-            'Expected messages "{}" does not partially match log:\n\n{}\n\n'.format(
-                str(expected_msgs), print_log))
+        remaining_expected = [e for e in remaining_expected if e not in log]
+        self._raise_assertion_error(f'Expected message(s) {remaining_expected!s} '
+                                    f'not found in log:\n\n{print_log}\n\n')
 
     @contextlib.contextmanager
     def wait_for_new_peer(self, timeout=5):
@@ -703,11 +717,12 @@ class TestNode():
         extra_args: extra arguments to pass through to bitcoind
         expected_msg: regex that stderr should match when bitcoind fails
 
-        Will throw if bitcoind starts without an error.
-        Will throw if an expected_msg is provided and it does not match bitcoind's stdout."""
+        Will raise if bitcoind starts without an error.
+        Will raise if an expected_msg is provided and it does not match bitcoind's stdout."""
         assert not self.running
         with tempfile.NamedTemporaryFile(dir=self.stderr_dir, delete=False) as log_stderr, \
              tempfile.NamedTemporaryFile(dir=self.stdout_dir, delete=False) as log_stdout:
+            assert_msg = None
             try:
                 self.start(extra_args, stdout=log_stdout, stderr=log_stderr, *args, **kwargs)
                 ret = self.process.wait(timeout=self.rpc_timeout)
@@ -731,7 +746,7 @@ class TestNode():
                         if expected_msg != stderr:
                             self._raise_assertion_error(
                                 'Expected message "{}" does not fully match stderr:\n"{}"'.format(expected_msg, stderr))
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 self.process.kill()
                 self.running = False
                 self.process = None
@@ -740,6 +755,10 @@ class TestNode():
                     assert_msg += "with an error"
                 else:
                     assert_msg += "with expected error " + expected_msg
+                assert_msg += f" (cmd: {e.cmd})"
+
+            # Raise assertion outside of except-block above in order for it not to be treated as a knock-on exception.
+            if assert_msg:
                 self._raise_assertion_error(assert_msg)
 
     def add_p2p_connection(self, p2p_conn, *, wait_for_verack=True, send_version=True, supports_v2_p2p=None, wait_for_v2_handshake=True, expect_success=True, **kwargs):
@@ -914,16 +933,17 @@ def arg_to_cli(arg):
 
 class TestNodeCLI():
     """Interface to bitcoin-cli for an individual node"""
-    def __init__(self, binaries, datadir):
+    def __init__(self, binaries, datadir, rpc_timeout):
         self.options = []
         self.binaries = binaries
         self.datadir = datadir
+        self.rpc_timeout = rpc_timeout
         self.input = None
         self.log = logging.getLogger('TestFramework.bitcoincli')
 
     def __call__(self, *options, input=None):
         # TestNodeCLI is callable with bitcoin-cli command-line options
-        cli = TestNodeCLI(self.binaries, self.datadir)
+        cli = TestNodeCLI(self.binaries, self.datadir, self.rpc_timeout)
         cli.options = [str(o) for o in options]
         cli.input = input
         return cli
@@ -944,17 +964,24 @@ class TestNodeCLI():
         """Run bitcoin-cli command. Deserializes returned string as python object."""
         pos_args = [arg_to_cli(arg) for arg in args]
         named_args = [key + "=" + arg_to_cli(value) for (key, value) in kwargs.items() if value is not None]
-        p_args = self.binaries.rpc_argv() + [f"-datadir={self.datadir}"] + self.options
+        p_args = self.binaries.rpc_argv() + [
+            f"-datadir={self.datadir}",
+            f"-rpcclienttimeout={int(self.rpc_timeout)}",
+        ] + self.options
         if named_args:
             p_args += ["-named"]
         base_arg_pos = len(p_args)
         if clicommand is not None:
             p_args += [clicommand]
         p_args += pos_args + named_args
-        max_arg_size = max(len(arg) for arg in p_args)
+
+        # TEST_CLI_MAX_ARG_SIZE is set low enough that checking the string
+        # length is enough and encoding to bytes is not needed before
+        # calculating the sum.
+        sum_arg_size = sum(len(arg) for arg in p_args)
         stdin_data = self.input
-        if max_arg_size > CLI_MAX_ARG_SIZE:
-            self.log.debug(f"Cli: Command size {max_arg_size} too large, using stdin")
+        if sum_arg_size >= TEST_CLI_MAX_ARG_SIZE:
+            self.log.debug(f"Cli: Command size {sum_arg_size} too large, using stdin")
             rpc_args = "\n".join([arg for arg in p_args[base_arg_pos:]])
             if stdin_data is not None:
                 stdin_data += "\n" + rpc_args

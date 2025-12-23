@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 The Bitcoin Core developers
+// Copyright (c) 2021-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -73,9 +73,9 @@ BOOST_AUTO_TEST_CASE(package_hash_tests)
     CTransactionRef ptx_3{MakeTransactionRef(tx_3)};
 
     // It's easy to see that wtxids are sorted in lexicographical order:
-    Wtxid wtxid_1{Wtxid::FromHex("85cd1a31eb38f74ed5742ec9cb546712ab5aaf747de28a9168b53e846cbda17f").value()};
-    Wtxid wtxid_2{Wtxid::FromHex("b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b").value()};
-    Wtxid wtxid_3{Wtxid::FromHex("e065bac15f62bb4e761d761db928ddee65a47296b2b776785abb912cdec474e3").value()};
+    constexpr Wtxid wtxid_1{"85cd1a31eb38f74ed5742ec9cb546712ab5aaf747de28a9168b53e846cbda17f"};
+    constexpr Wtxid wtxid_2{"b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b"};
+    constexpr Wtxid wtxid_3{"e065bac15f62bb4e761d761db928ddee65a47296b2b776785abb912cdec474e3"};
     BOOST_CHECK_EQUAL(tx_1.GetWitnessHash(), wtxid_1);
     BOOST_CHECK_EQUAL(tx_2.GetWitnessHash(), wtxid_2);
     BOOST_CHECK_EQUAL(tx_3.GetWitnessHash(), wtxid_3);
@@ -84,9 +84,9 @@ BOOST_AUTO_TEST_CASE(package_hash_tests)
     BOOST_CHECK(wtxid_2.GetHex() < wtxid_3.GetHex());
 
     // The txids are not (we want to test that sorting and hashing use wtxid, not txid):
-    Txid txid_1{Txid::FromHex("bd0f71c1d5e50589063e134fad22053cdae5ab2320db5bf5e540198b0b5a4e69").value()};
-    Txid txid_2{Txid::FromHex("b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b").value()};
-    Txid txid_3{Txid::FromHex("ee707be5201160e32c4fc715bec227d1aeea5940fb4295605e7373edce3b1a93").value()};
+    constexpr Txid txid_1{"bd0f71c1d5e50589063e134fad22053cdae5ab2320db5bf5e540198b0b5a4e69"};
+    constexpr Txid txid_2{"b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b"};
+    constexpr Txid txid_3{"ee707be5201160e32c4fc715bec227d1aeea5940fb4295605e7373edce3b1a93"};
     BOOST_CHECK_EQUAL(tx_1.GetHash(), txid_1);
     BOOST_CHECK_EQUAL(tx_2.GetHash(), txid_2);
     BOOST_CHECK_EQUAL(tx_3.GetHash(), txid_3);
@@ -239,7 +239,7 @@ BOOST_AUTO_TEST_CASE(package_validation_tests)
     }
     // A single, giant transaction submitted through ProcessNewPackage fails on single tx policy.
     CTransactionRef giant_ptx = create_placeholder_tx(999, 999);
-    BOOST_CHECK(GetVirtualTransactionSize(*giant_ptx) > DEFAULT_ANCESTOR_SIZE_LIMIT_KVB * 1000);
+    BOOST_CHECK(GetVirtualTransactionSize(*giant_ptx) > DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000);
     Package package_single_giant{giant_ptx};
     auto result_single_large = ProcessNewPackage(m_node.chainman->ActiveChainstate(), *m_node.mempool, package_single_giant, /*test_accept=*/true, /*client_maxfeerate=*/{});
     if (auto err_single_large{CheckPackageMempoolAcceptResult(package_single_giant, result_single_large, /*expect_valid=*/false, nullptr)}) {
@@ -357,7 +357,7 @@ BOOST_AUTO_TEST_CASE(package_submission_tests)
 {
     // Mine blocks to mature coinbases.
     mineBlocks(3);
-    MockMempoolMinFee(CFeeRate(5000));
+    MockMempoolMinFee(CFeeRate(5000), *m_node.mempool);
     LOCK(cs_main);
     unsigned int expected_pool_size = m_node.mempool->size();
     CKey parent_key = GenerateRandomKey();
@@ -634,7 +634,7 @@ BOOST_AUTO_TEST_CASE(package_witness_swap_tests)
 {
     // Mine blocks to mature coinbases.
     mineBlocks(5);
-    MockMempoolMinFee(CFeeRate(5000));
+    MockMempoolMinFee(CFeeRate(5000), *m_node.mempool);
     LOCK(cs_main);
 
     // Transactions with a same-txid-different-witness transaction in the mempool should be ignored,
@@ -867,7 +867,7 @@ BOOST_AUTO_TEST_CASE(package_witness_swap_tests)
 BOOST_AUTO_TEST_CASE(package_cpfp_tests)
 {
     mineBlocks(5);
-    MockMempoolMinFee(CFeeRate(5000));
+    MockMempoolMinFee(CFeeRate(5000), *m_node.mempool);
     LOCK(::cs_main);
     size_t expected_pool_size = m_node.mempool->size();
     CKey child_key = GenerateRandomKey();
