@@ -49,6 +49,7 @@
 #include <random.h>
 #include <script/script.h>
 #include <script/sigcache.h>
+#include <script/interpreter.h>
 #include <signet.h>
 #include <tinyformat.h>
 #include <txdb.h>
@@ -73,7 +74,9 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstring>
 #include <deque>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -124,6 +127,76 @@ TRACEPOINT_SEMAPHORE(validation, block_connected);
 TRACEPOINT_SEMAPHORE(utxocache, flush);
 TRACEPOINT_SEMAPHORE(mempool, replaced);
 TRACEPOINT_SEMAPHORE(mempool, rejected);
+
+#ifdef ENABLE_GPU_ACCELERATION
+// =========================================================================
+// GPU UTXO Set - File-scope state for use by ConnectBlock and DisconnectBlock
+// =========================================================================
+static std::unique_ptr<gpu::GPUUTXOSet> g_gpu_utxo_set;
+static std::unique_ptr<gpu::GPUBatchValidator> g_gpu_block_validator;
+static bool g_gpu_block_enabled = false;
+static bool g_gpu_block_validation_enabled = false;
+static bool g_gpu_utxo_loaded = false;
+static std::mutex g_gpu_mutex;  // Protect GPU state during reorgs
+
+// Reserve 2GB for batch validator (script contexts need ~1MB each, 1000 contexts = ~1GB)
+// Extra headroom for script blobs, witness data, and overhead
+static constexpr size_t GPU_BATCH_VALIDATOR_RESERVE = 2048ULL * 1024 * 1024;
+
+// Initialize GPU block validation subsystem
+static bool InitGPUBlockValidation() {
+    if (g_gpu_block_enabled) return true;
+
+    g_gpu_block_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
+    g_gpu_block_validation_enabled = gArgs.GetBoolArg("-gpuvalidation", true);
+
+    if (!g_gpu_block_enabled) return false;
+
+    // Get VRAM limit from args (in MB), default 8192 MB
+    int64_t vram_mb = gArgs.GetIntArg("-gpuvram", 8192);
+    size_t vram_limit = static_cast<size_t>(vram_mb) * 1024 * 1024;
+
+    // Reserve space for batch validator if validation is enabled
+    size_t utxo_limit = vram_limit;
+    if (g_gpu_block_validation_enabled && vram_limit > GPU_BATCH_VALIDATOR_RESERVE) {
+        utxo_limit = vram_limit - GPU_BATCH_VALIDATOR_RESERVE;
+        LogInfo("GPU: Reserving %zu MB for batch validator, %zu MB for UTXO set\n",
+                GPU_BATCH_VALIDATOR_RESERVE / (1024 * 1024), utxo_limit / (1024 * 1024));
+    }
+
+    g_gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
+    if (!g_gpu_utxo_set->Initialize(utxo_limit)) {
+        LogWarning("GPU UTXO set initialization failed, falling back to CPU\n");
+        g_gpu_block_enabled = false;
+        g_gpu_utxo_set.reset();
+        return false;
+    }
+    LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", utxo_limit / (1024 * 1024));
+
+    if (g_gpu_block_validation_enabled) {
+        g_gpu_block_validator = std::make_unique<gpu::GPUBatchValidator>();
+        if (!g_gpu_block_validator->Initialize()) {
+            LogWarning("GPU batch validator initialization failed, falling back to CPU\n");
+            g_gpu_block_validation_enabled = false;
+            g_gpu_block_validator.reset();
+        } else {
+            LogInfo("GPU block batch validator initialized\n");
+            g_gpu_block_validator->SetUTXOSet(g_gpu_utxo_set.get());
+        }
+    }
+
+    return g_gpu_block_enabled;
+}
+
+// Get GPU UTXO set (creates if needed)
+static gpu::GPUUTXOSet* GetGPUUTXOSet() {
+    std::lock_guard<std::mutex> lock(g_gpu_mutex);
+    if (!g_gpu_block_enabled && !InitGPUBlockValidation()) {
+        return nullptr;
+    }
+    return g_gpu_utxo_set.get();
+}
+#endif // ENABLE_GPU_ACCELERATION
 
 const CBlockIndex* Chainstate::FindForkInGlobalIndex(const CBlockLocator& locator) const
 {
@@ -2467,6 +2540,69 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         return DISCONNECT_FAILED;
     }
 
+#ifdef ENABLE_GPU_ACCELERATION
+    // GPU UTXO set update for reorg handling (Phase 8)
+    gpu::GPUUTXOSet* gpu_utxo = GetGPUUTXOSet();
+    if (gpu_utxo && g_gpu_utxo_loaded) {
+        std::lock_guard<std::mutex> lock(g_gpu_mutex);
+
+        LogDebug(BCLog::VALIDATION, "GPU DisconnectBlock: height=%d, txns=%zu\n",
+                 pindex->nHeight, block.vtx.size());
+
+        gpu_utxo->BeginBatchUpdate();
+
+        // Process transactions in reverse order (same as CPU path)
+        for (int i = block.vtx.size() - 1; i >= 0; i--) {
+            const CTransaction& tx = *(block.vtx[i]);
+            Txid hash = tx.GetHash();
+
+            // Remove outputs created by this transaction
+            for (size_t o = 0; o < tx.vout.size(); o++) {
+                if (!tx.vout[o].scriptPubKey.IsUnspendable()) {
+                    // Convert Txid to uint256 for GPU interface
+                    uint256 txid_uint256;
+                    std::memcpy(txid_uint256.data(), hash.data(), 32);
+                    gpu_utxo->RemoveUTXO(txid_uint256, static_cast<uint32_t>(o));
+                }
+            }
+
+            // Restore inputs from undo data
+            if (i > 0) { // not coinbase
+                const CTxUndo& txundo = blockUndo.vtxundo[i-1];
+                for (unsigned int j = 0; j < tx.vin.size(); j++) {
+                    const COutPoint& prevout = tx.vin[j].prevout;
+                    const Coin& undo_coin = txundo.vprevout[j];
+
+                    // Build GPU UTXO header from undo coin
+                    gpu::UTXOHeader header;
+                    header.amount = undo_coin.out.nValue;
+                    header.blockHeight = undo_coin.nHeight;
+                    header.vout = prevout.n;
+                    header.flags = undo_coin.fCoinBase ? gpu::UTXO_FLAG_COINBASE : 0;
+                    header.script_size = static_cast<uint16_t>(undo_coin.out.scriptPubKey.size());
+                    header.script_type = static_cast<uint8_t>(gpu::SCRIPT_TYPE_UNKNOWN);
+                    std::memset(header.padding, 0, sizeof(header.padding));
+
+                    // Convert prevout.hash to uint256
+                    uint256 prevout_txid;
+                    std::memcpy(prevout_txid.data(), prevout.hash.data(), 32);
+
+                    gpu_utxo->RestoreUTXO(prevout_txid, prevout.n, header,
+                                         undo_coin.out.scriptPubKey.data());
+                }
+            }
+        }
+
+        if (!gpu_utxo->CommitBatchUpdate()) {
+            LogWarning("GPU DisconnectBlock: batch update commit failed, GPU UTXO may be inconsistent\n");
+            // Continue with CPU path - it's authoritative
+        } else {
+            LogDebug(BCLog::VALIDATION, "GPU DisconnectBlock: committed, UTXOs=%zu\n",
+                     gpu_utxo->GetNumUTXOs());
+        }
+    }
+#endif // ENABLE_GPU_ACCELERATION
+
     // Ignore blocks that contain transactions which are 'overwritten' by later transactions,
     // unless those are already completely spent.
     // See https://github.com/bitcoin/bitcoin/issues/22596 for additional information.
@@ -2786,9 +2922,6 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // in multiple threads). Preallocate the vector size so a new allocation
     // doesn't invalidate pointers into the vector, and keep txsdata in scope
     // for as long as `control`.
-    std::optional<CCheckQueueControl<CScriptCheck>> control;
-    if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) control.emplace(queue);
-
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
 
 #ifdef ENABLE_GPU_ACCELERATION
@@ -2869,6 +3002,24 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     }
 #endif
 
+    // CPU parallel script check control - only used when GPU validation is NOT active
+    // When GPU handles script validation, we don't need the CPU thread pool
+    std::optional<CCheckQueueControl<CScriptCheck>> control;
+#ifdef ENABLE_GPU_ACCELERATION
+    bool use_gpu_validation = gpu_enabled && gpu_batch_validator && gpu_validation_enabled;
+    if (!use_gpu_validation) {
+        if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) {
+            control.emplace(queue);
+        }
+    } else {
+        LogDebug(BCLog::BENCH, "GPU validation active, skipping CPU script check queue\n");
+    }
+#else
+    if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) {
+        control.emplace(queue);
+    }
+#endif
+
     std::vector<int> prevheights;
     CAmount nFees = 0;
     int nInputs = 0;
@@ -2944,7 +3095,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 #ifdef ENABLE_GPU_ACCELERATION
             // Queue transaction for GPU batch validation
             bool use_gpu_for_this_tx = false;
-            if (gpu_enabled && gpu_batch_validator && gpu_validation_enabled && !control) {
+            if (use_gpu_validation) {
                 // Check if all inputs have valid UTXOs for GPU validation
                 bool gpu_validation_suitable = true;
                 for (const auto& input : tx.vin) {
@@ -2959,6 +3110,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 }
 
                 if (gpu_validation_suitable) {
+                    // Initialize PrecomputedTransactionData for sighash computation
+                    // Collect spent outputs for this transaction
+                    std::vector<CTxOut> spent_outputs;
+                    spent_outputs.reserve(tx.vin.size());
+                    for (const auto& input : tx.vin) {
+                        const Coin& coin = view.AccessCoin(input.prevout);
+                        spent_outputs.push_back(coin.out);
+                    }
+                    txsdata[i].Init(tx, std::move(spent_outputs));
+
                     // Queue all inputs for this transaction
                     for (size_t j = 0; j < tx.vin.size(); j++) {
                         const CTxIn& txin = tx.vin[j];
@@ -2966,16 +3127,36 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
                         // Determine sigversion based on script type
                         gpu::GPUSigVersion sigversion = gpu::GPU_SIGVERSION_BASE;
+                        SigVersion cpu_sigversion = SigVersion::BASE;
                         gpu::ScriptType stype = gpu::IdentifyScriptType(
                             coin.out.scriptPubKey.data(),
                             coin.out.scriptPubKey.size());
                         if (stype == gpu::SCRIPT_TYPE_P2WPKH || stype == gpu::SCRIPT_TYPE_P2WSH) {
                             sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
+                            cpu_sigversion = SigVersion::WITNESS_V0;
                         } else if (stype == gpu::SCRIPT_TYPE_P2TR) {
                             sigversion = gpu::GPU_SIGVERSION_TAPROOT;
+                            cpu_sigversion = SigVersion::TAPROOT;
                         } else if (stype == gpu::SCRIPT_TYPE_P2SH && !txin.scriptWitness.IsNull()) {
                             // P2SH-wrapped witness (P2SH-P2WPKH or P2SH-P2WSH)
                             sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
+                            cpu_sigversion = SigVersion::WITNESS_V0;
+                        }
+
+                        // Compute sighash (assume SIGHASH_ALL which covers 99%+ of transactions)
+                        // If signature uses different sighash type, GPU will fall back to CPU
+                        uint256 sighash;
+                        const uint8_t* sighash_ptr = nullptr;
+                        if (cpu_sigversion == SigVersion::TAPROOT) {
+                            // BIP341 Taproot sighash (use SIGHASH_DEFAULT = 0x00)
+                            ScriptExecutionData execdata;
+                            if (SignatureHashSchnorr(sighash, execdata, tx, j, 0x00, cpu_sigversion, txsdata[i], MissingDataBehavior::FAIL)) {
+                                sighash_ptr = sighash.data();
+                            }
+                        } else {
+                            // Legacy or BIP143 sighash (SIGHASH_ALL = 0x01)
+                            sighash = SignatureHash(coin.out.scriptPubKey, tx, j, SIGHASH_ALL, coin.out.nValue, cpu_sigversion, &txsdata[i]);
+                            sighash_ptr = sighash.data();
                         }
 
                         // Serialize witness data
@@ -3001,7 +3182,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                             coin.out.nValue,
                             txin.nSequence,
                             static_cast<uint32_t>(flags.as_int()),
-                            sigversion
+                            sigversion,
+                            sighash_ptr  // Pass precomputed sighash
                         );
 
                         if (job_idx >= 0) {

@@ -136,7 +136,46 @@ bool GPUBatchValidator::Initialize(size_t max_jobs, size_t script_blob_size, siz
         return false;
     }
 
-    m_max_jobs = max_jobs;
+    // Query available GPU memory to dynamically size max_jobs
+    size_t free_mem = 0, total_mem = 0;
+    err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (err != cudaSuccess) {
+        GPU_LOG_WARNING("Could not query GPU memory, using defaults");
+        free_mem = 1024ULL * 1024 * 1024;  // Assume 1GB if query fails
+    }
+
+    // Reserve 100MB for other allocations and overhead
+    const size_t OVERHEAD_RESERVE = 100ULL * 1024 * 1024;
+    size_t available = (free_mem > OVERHEAD_RESERVE) ? (free_mem - OVERHEAD_RESERVE) : 0;
+
+    // Calculate how many contexts can fit
+    // Each GPUScriptContext is ~1.05MB (CONTEXT_SIZE_BYTES)
+    // Plus we need space for: jobs array, script blobs, witness blob, tx contexts
+    size_t per_job_overhead = sizeof(ScriptValidationJob) + sizeof(TxContext) +
+                              256;  // Average script data per job
+    size_t fixed_overhead = script_blob_size + witness_blob_size;
+
+    size_t memory_per_job = CONTEXT_SIZE_BYTES + per_job_overhead;
+    size_t max_possible_jobs = 0;
+    if (available > fixed_overhead) {
+        max_possible_jobs = (available - fixed_overhead) / memory_per_job;
+    }
+
+    // Apply limits
+    if (max_possible_jobs < MIN_MAX_JOBS) {
+        GPU_LOG_ERROR("Insufficient GPU memory for batch validation: %zu MB free, need at least %zu MB",
+                      free_mem / (1024 * 1024),
+                      (MIN_MAX_JOBS * memory_per_job + fixed_overhead) / (1024 * 1024));
+        return false;
+    }
+
+    // Cap at requested max_jobs or available memory, whichever is smaller
+    m_max_jobs = (max_possible_jobs < max_jobs) ? max_possible_jobs : max_jobs;
+
+    GPU_LOG_INFO("GPU memory: %zu MB free, allocating batch validator for %zu jobs (%.1f MB for contexts)",
+                 free_mem / (1024 * 1024), m_max_jobs,
+                 (m_max_jobs * CONTEXT_SIZE_BYTES) / (1024.0 * 1024.0));
+
     m_scriptpubkey_max = script_blob_size / 2;
     m_scriptsig_max = script_blob_size / 2;
     m_witness_max = witness_blob_size;
@@ -270,7 +309,8 @@ int GPUBatchValidator::QueueJob(
     int64_t amount,
     uint32_t sequence,
     uint32_t verify_flags,
-    GPUSigVersion sigversion)
+    GPUSigVersion sigversion,
+    const uint8_t* sighash)
 {
     if (!m_initialized || !m_batch_active) {
         return -1;
@@ -331,8 +371,15 @@ int GPUBatchValidator::QueueJob(
     job.verify_flags = verify_flags;
     job.sigversion = sigversion;
 
+    // Set precomputed sighash if provided
+    if (sighash) {
+        job.sighash_valid = true;
+        memcpy(job.sighash.data, sighash, 32);
+    } else {
+        job.sighash_valid = false;
+    }
+
     // Initialize result fields
-    job.sighash_valid = false;
     job.error = GPU_SCRIPT_ERR_OK;
     job.validated = false;
     job.valid = false;
@@ -1105,6 +1152,14 @@ __global__ void BatchValidateScriptsKernel(
     ctx.verify_flags = job.verify_flags;
     ctx.input_amount = job.amount;
     ctx.input_sequence = job.sequence;
+
+    // Copy precomputed sighash from job to context
+    ctx.precomputed_sighash_valid = job.sighash_valid;
+    if (job.sighash_valid) {
+        for (int i = 0; i < 32; i++) {
+            ctx.precomputed_sighash.data[i] = job.sighash.data[i];
+        }
+    }
 
     bool success = false;
     bool has_witness = (job.witness_count > 0 && job.witness_total_size > 0);

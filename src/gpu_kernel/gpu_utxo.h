@@ -129,7 +129,9 @@ public:
     uint32_t Hash4(const uint256& txid, uint32_t vout) const;
     
     // 4-way Cuckoo hash tables
-    static constexpr size_t TABLE_SIZE = 26214400;  // 26M entries per table
+    // Reduced from 26M to 10M entries per table to save VRAM
+    // 10M * 4 tables * 4 bytes = 160MB (vs 400MB before)
+    static constexpr size_t TABLE_SIZE = 10000000;  // 10M entries per table
 
 private:
     // Device memory pointers
@@ -149,7 +151,52 @@ private:
     size_t totalVRAMUsed;
     size_t totalFreeSpace;
     size_t maxVRAMLimit;
-    
+
+    // =========================================================================
+    // Batch update tracking (Phase 8 - Reorg handling)
+    // =========================================================================
+    bool m_batch_active{false};
+
+    // Staged operations for batch commit using fixed-size arrays
+    // Maximum capacity for batch operations (enough for largest blocks)
+    static constexpr size_t MAX_STAGED_ADDS = 10000;
+    static constexpr size_t MAX_STAGED_REMOVES = 10000;
+    static constexpr size_t MAX_STAGED_RESTORES = 10000;
+    static constexpr size_t MAX_SCRIPT_PER_STAGED = 520;  // Max script size
+
+    struct StagedAdd {
+        uint256_gpu txid;
+        uint32_t vout;
+        UTXOHeader header;
+        uint8_t script_data[MAX_SCRIPT_PER_STAGED];
+        uint16_t script_len;
+    };
+
+    struct StagedRemove {
+        uint256_gpu txid;
+        uint32_t vout;
+        uint32_t utxo_index;  // Index in headers array
+    };
+
+    struct StagedRestore {
+        uint256_gpu txid;
+        uint32_t vout;
+        uint32_t utxo_index;  // Index of previously spent UTXO
+    };
+
+    // Host-side staging arrays (allocated lazily)
+    StagedAdd* m_staged_adds{nullptr};
+    StagedRemove* m_staged_removes{nullptr};
+    StagedRestore* m_staged_restores{nullptr};
+    size_t m_staged_adds_count{0};
+    size_t m_staged_removes_count{0};
+    size_t m_staged_restores_count{0};
+
+    // Snapshot of state before batch for rollback
+    size_t m_snapshot_numUTXOs{0};
+    size_t m_snapshot_scriptBlobUsed{0};
+    size_t m_snapshot_txidTableUsed{0};
+
     // Memory allocation helpers
     bool AllocateDeviceMemory();
     void FreeDeviceMemory();

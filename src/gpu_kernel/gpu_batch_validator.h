@@ -89,9 +89,16 @@ struct BatchValidationResult {
 class GPUBatchValidator {
 public:
     // Configuration
-    static constexpr size_t DEFAULT_MAX_JOBS = 100000;
-    static constexpr size_t DEFAULT_SCRIPT_BLOB_SIZE = 64 * 1024 * 1024;  // 64MB
-    static constexpr size_t DEFAULT_WITNESS_BLOB_SIZE = 128 * 1024 * 1024; // 128MB
+    // NOTE: GPUScriptContext is ~1.05MB each (2x stack of 1000 * 524 bytes)
+    // With typical 1-2GB available for batch validator after UTXO set allocation,
+    // we dynamically calculate max_jobs based on available memory.
+    // 1000 jobs = ~1.05GB which fits in typical remaining VRAM.
+    // Blocks have ~2000-4000 inputs, so we may need multiple batches for large blocks.
+    static constexpr size_t DEFAULT_MAX_JOBS = 1000;
+    static constexpr size_t MIN_MAX_JOBS = 100;  // Minimum useful batch size
+    static constexpr size_t CONTEXT_SIZE_BYTES = 1100000;  // ~1.05MB per GPUScriptContext
+    static constexpr size_t DEFAULT_SCRIPT_BLOB_SIZE = 16 * 1024 * 1024;  // 16MB
+    static constexpr size_t DEFAULT_WITNESS_BLOB_SIZE = 32 * 1024 * 1024; // 32MB
 
     GPUBatchValidator();
     ~GPUBatchValidator();
@@ -109,6 +116,7 @@ public:
 
     // Queue a script validation job
     // Returns job index, or -1 if queue is full
+    // sighash: precomputed signature hash (32 bytes), or nullptr if not available
     int QueueJob(
         uint32_t tx_index,
         uint32_t input_index,
@@ -118,7 +126,8 @@ public:
         int64_t amount,
         uint32_t sequence,
         uint32_t verify_flags,
-        GPUSigVersion sigversion
+        GPUSigVersion sigversion,
+        const uint8_t* sighash = nullptr  // 32-byte precomputed sighash, or nullptr
     );
 
     // Queue from Bitcoin Core types (convenience wrapper)

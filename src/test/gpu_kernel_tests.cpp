@@ -12737,6 +12737,541 @@ BOOST_AUTO_TEST_CASE(gpu_mempool_rapid_reinit)
     validator.Shutdown();
 }
 
+// =========================================================================
+// GPU UTXO Set Reorg Tests - Phase 8
+// =========================================================================
+
+BOOST_AUTO_TEST_CASE(gpu_utxo_batch_begin_end)
+{
+    // Test basic batch begin/commit cycle
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));  // 1MB for tests
+
+    BOOST_CHECK(!utxo_set.IsInBatchUpdate());
+    utxo_set.BeginBatchUpdate();
+    BOOST_CHECK(utxo_set.IsInBatchUpdate());
+    BOOST_CHECK(utxo_set.CommitBatchUpdate());
+    BOOST_CHECK(!utxo_set.IsInBatchUpdate());
+}
+
+BOOST_AUTO_TEST_CASE(gpu_utxo_batch_abort)
+{
+    // Test batch abort restores state
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    size_t initial_count = utxo_set.GetNumUTXOs();
+
+    utxo_set.BeginBatchUpdate();
+    BOOST_CHECK(utxo_set.IsInBatchUpdate());
+
+    // Add a UTXO during batch (not directly - would need implementation)
+    // For now just verify abort works
+    utxo_set.AbortBatchUpdate();
+
+    BOOST_CHECK(!utxo_set.IsInBatchUpdate());
+    BOOST_CHECK_EQUAL(utxo_set.GetNumUTXOs(), initial_count);
+}
+
+BOOST_AUTO_TEST_CASE(gpu_utxo_add_remove_basic)
+{
+    // Test adding and removing UTXOs
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    // Create a test UTXO
+    uint256 txid;
+    memset(txid.data(), 0x42, 32);
+    uint32_t vout = 0;
+
+    ::gpu::UTXOHeader header;
+    header.amount = 50 * 100000000ULL;  // 50 BTC
+    header.blockHeight = 100;
+    header.txid_index = 0;
+    header.script_size = 25;
+    header.vout = vout;
+    header.flags = 0;
+    header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2PKH);
+    memset(header.padding, 0, sizeof(header.padding));
+
+    // P2PKH script
+    uint8_t script[25] = { 0x76, 0xa9, 0x14 };
+    memset(&script[3], 0xAB, 20);
+    script[23] = 0x88;
+    script[24] = 0xac;
+
+    // Add the UTXO
+    size_t count_before = utxo_set.GetNumUTXOs();
+    BOOST_CHECK(utxo_set.AddUTXO(txid, vout, header, script));
+    BOOST_CHECK_EQUAL(utxo_set.GetNumUTXOs(), count_before + 1);
+
+    // Verify it exists
+    BOOST_CHECK(utxo_set.HasUTXO(txid, vout));
+
+    // Remove the UTXO
+    BOOST_CHECK(utxo_set.RemoveUTXO(txid, vout));
+
+    // Verify it's no longer accessible
+    BOOST_CHECK(!utxo_set.HasUTXO(txid, vout));
+}
+
+BOOST_AUTO_TEST_CASE(gpu_utxo_spend_and_restore)
+{
+    // Test spending and restoring UTXOs (core reorg operation)
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    // Create a test UTXO
+    uint256 txid;
+    memset(txid.data(), 0x55, 32);
+    uint32_t vout = 1;
+
+    ::gpu::UTXOHeader header;
+    header.amount = 25 * 100000000ULL;  // 25 BTC
+    header.blockHeight = 200;
+    header.txid_index = 0;
+    header.script_size = 22;
+    header.vout = vout;
+    header.flags = 0;
+    header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2WPKH);
+    memset(header.padding, 0, sizeof(header.padding));
+
+    // P2WPKH script
+    uint8_t script[22] = { 0x00, 0x14 };
+    memset(&script[2], 0xCD, 20);
+
+    // Add and then spend the UTXO
+    BOOST_CHECK(utxo_set.AddUTXO(txid, vout, header, script));
+    BOOST_CHECK(utxo_set.HasUTXO(txid, vout));
+    BOOST_CHECK(utxo_set.SpendUTXO(txid, vout));
+    BOOST_CHECK(!utxo_set.HasUTXO(txid, vout));
+
+    // Restore the UTXO (simulates reorg unspending)
+    BOOST_CHECK(utxo_set.RestoreUTXO(txid, vout, header, script));
+    BOOST_CHECK(utxo_set.HasUTXO(txid, vout));
+}
+
+BOOST_AUTO_TEST_CASE(gpu_utxo_batch_multiple_ops)
+{
+    // Test batching multiple operations
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    // Create 10 UTXOs
+    std::vector<uint256> txids(10);
+    for (int i = 0; i < 10; i++) {
+        memset(txids[i].data(), static_cast<uint8_t>(0x10 + i), 32);
+
+        ::gpu::UTXOHeader header;
+        header.amount = static_cast<uint64_t>((i + 1)) * 100000000ULL;
+        header.blockHeight = 300 + static_cast<uint32_t>(i);
+        header.txid_index = 0;
+        header.script_size = 25;
+        header.vout = 0;
+        header.flags = 0;
+        header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2PKH);
+        memset(header.padding, 0, sizeof(header.padding));
+
+        uint8_t script[25] = { 0x76, 0xa9, 0x14 };
+        memset(&script[3], static_cast<uint8_t>(0x20 + i), 20);
+        script[23] = 0x88;
+        script[24] = 0xac;
+
+        BOOST_CHECK(utxo_set.AddUTXO(txids[i], 0, header, script));
+    }
+
+    size_t count_before = utxo_set.GetNumUTXOs();
+    BOOST_CHECK_EQUAL(count_before, 10u);
+
+    // Start batch and remove half
+    utxo_set.BeginBatchUpdate();
+    for (int i = 0; i < 5; i++) {
+        utxo_set.RemoveUTXO(txids[i], 0);
+    }
+    BOOST_CHECK(utxo_set.CommitBatchUpdate());
+
+    // Verify remaining UTXOs
+    for (int i = 0; i < 5; i++) {
+        BOOST_CHECK(!utxo_set.HasUTXO(txids[i], 0));
+    }
+    for (int i = 5; i < 10; i++) {
+        BOOST_CHECK(utxo_set.HasUTXO(txids[i], 0));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(gpu_reorg_simple_1_block)
+{
+    // Simulate a 1-block reorg
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    // Create a "block" with 2 transactions
+    // TX1: Creates outputs (simulating coinbase)
+    uint256 tx1_id;
+    memset(tx1_id.data(), 0xC1, 32);
+
+    ::gpu::UTXOHeader tx1_out0, tx1_out1;
+    tx1_out0.amount = 50 * 100000000ULL;
+    tx1_out0.blockHeight = 500;
+    tx1_out0.script_size = 25;
+    tx1_out0.vout = 0;
+    tx1_out0.flags = ::gpu::UTXO_FLAG_COINBASE;
+    tx1_out0.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2PKH);
+    memset(tx1_out0.padding, 0, sizeof(tx1_out0.padding));
+
+    tx1_out1 = tx1_out0;
+    tx1_out1.vout = 1;
+    tx1_out1.amount = 10 * 100000000ULL;
+
+    uint8_t script[25] = { 0x76, 0xa9, 0x14 };
+    memset(&script[3], 0xAA, 20);
+    script[23] = 0x88;
+    script[24] = 0xac;
+
+    // Add the coinbase outputs
+    BOOST_CHECK(utxo_set.AddUTXO(tx1_id, 0, tx1_out0, script));
+    BOOST_CHECK(utxo_set.AddUTXO(tx1_id, 1, tx1_out1, script));
+
+    BOOST_CHECK_EQUAL(utxo_set.GetNumUTXOs(), 2u);
+
+    // Now simulate DISCONNECTING this block (reorg)
+    utxo_set.BeginBatchUpdate();
+
+    // Remove outputs created by this block
+    utxo_set.RemoveUTXO(tx1_id, 0);
+    utxo_set.RemoveUTXO(tx1_id, 1);
+
+    BOOST_CHECK(utxo_set.CommitBatchUpdate());
+
+    // Block is disconnected - outputs should be gone
+    BOOST_CHECK(!utxo_set.HasUTXO(tx1_id, 0));
+    BOOST_CHECK(!utxo_set.HasUTXO(tx1_id, 1));
+}
+
+BOOST_AUTO_TEST_CASE(gpu_reorg_simple_3_blocks)
+{
+    // Simulate a 3-block reorg with spending
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    uint8_t script[25] = { 0x76, 0xa9, 0x14 };
+    memset(&script[3], 0xBB, 20);
+    script[23] = 0x88;
+    script[24] = 0xac;
+
+    // Block 100: Coinbase creates 2 outputs
+    uint256 blk100_tx1;
+    memset(blk100_tx1.data(), 0xA1, 32);
+
+    ::gpu::UTXOHeader header;
+    header.blockHeight = 100;
+    header.script_size = 25;
+    header.flags = ::gpu::UTXO_FLAG_COINBASE;
+    header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2PKH);
+    memset(header.padding, 0, sizeof(header.padding));
+
+    header.amount = 50 * 100000000ULL;
+    header.vout = 0;
+    BOOST_CHECK(utxo_set.AddUTXO(blk100_tx1, 0, header, script));
+    header.vout = 1;
+    header.amount = 10 * 100000000ULL;
+    BOOST_CHECK(utxo_set.AddUTXO(blk100_tx1, 1, header, script));
+
+    // Block 101: Coinbase + Tx spending block 100 output 0
+    uint256 blk101_cb, blk101_tx2;
+    memset(blk101_cb.data(), 0xB1, 32);
+    memset(blk101_tx2.data(), 0xB2, 32);
+
+    header.blockHeight = 101;
+    header.flags = ::gpu::UTXO_FLAG_COINBASE;
+    header.amount = 50 * 100000000ULL;
+    header.vout = 0;
+    BOOST_CHECK(utxo_set.AddUTXO(blk101_cb, 0, header, script));
+
+    // Spend blk100_tx1 output 0
+    BOOST_CHECK(utxo_set.SpendUTXO(blk100_tx1, 0));
+
+    // blk101_tx2 creates new output
+    header.flags = 0;
+    header.amount = 49 * 100000000ULL;
+    BOOST_CHECK(utxo_set.AddUTXO(blk101_tx2, 0, header, script));
+
+    // Block 102: Coinbase + Tx spending block 101 tx2 output
+    uint256 blk102_cb, blk102_tx2;
+    memset(blk102_cb.data(), 0xC1, 32);
+    memset(blk102_tx2.data(), 0xC2, 32);
+
+    header.blockHeight = 102;
+    header.flags = ::gpu::UTXO_FLAG_COINBASE;
+    header.amount = 50 * 100000000ULL;
+    header.vout = 0;
+    BOOST_CHECK(utxo_set.AddUTXO(blk102_cb, 0, header, script));
+
+    // Spend blk101_tx2 output 0
+    BOOST_CHECK(utxo_set.SpendUTXO(blk101_tx2, 0));
+
+    // blk102_tx2 creates new output
+    header.flags = 0;
+    header.amount = 48 * 100000000ULL;
+    BOOST_CHECK(utxo_set.AddUTXO(blk102_tx2, 0, header, script));
+
+    // State check before reorg
+    BOOST_CHECK(!utxo_set.HasUTXO(blk100_tx1, 0));  // Spent
+    BOOST_CHECK(utxo_set.HasUTXO(blk100_tx1, 1));   // Unspent
+    BOOST_CHECK(utxo_set.HasUTXO(blk101_cb, 0));    // Coinbase unspent
+    BOOST_CHECK(!utxo_set.HasUTXO(blk101_tx2, 0));  // Spent
+    BOOST_CHECK(utxo_set.HasUTXO(blk102_cb, 0));    // Coinbase unspent
+    BOOST_CHECK(utxo_set.HasUTXO(blk102_tx2, 0));   // Unspent
+
+    // ========= REORG: Disconnect blocks 102, 101, 100 =========
+
+    // Disconnect block 102
+    utxo_set.BeginBatchUpdate();
+    utxo_set.RemoveUTXO(blk102_cb, 0);     // Remove coinbase
+    utxo_set.RemoveUTXO(blk102_tx2, 0);    // Remove tx output
+    header.blockHeight = 101;
+    header.amount = 49 * 100000000ULL;
+    utxo_set.RestoreUTXO(blk101_tx2, 0, header, script);  // Restore spent input
+    BOOST_CHECK(utxo_set.CommitBatchUpdate());
+
+    // Disconnect block 101
+    utxo_set.BeginBatchUpdate();
+    utxo_set.RemoveUTXO(blk101_cb, 0);     // Remove coinbase
+    utxo_set.RemoveUTXO(blk101_tx2, 0);    // Remove tx output (was just restored)
+    header.blockHeight = 100;
+    header.amount = 50 * 100000000ULL;
+    utxo_set.RestoreUTXO(blk100_tx1, 0, header, script);  // Restore spent input
+    BOOST_CHECK(utxo_set.CommitBatchUpdate());
+
+    // Disconnect block 100
+    utxo_set.BeginBatchUpdate();
+    utxo_set.RemoveUTXO(blk100_tx1, 0);    // Remove coinbase output 0 (was just restored)
+    utxo_set.RemoveUTXO(blk100_tx1, 1);    // Remove coinbase output 1
+    BOOST_CHECK(utxo_set.CommitBatchUpdate());
+
+    // State check after reorg - all 3 blocks disconnected
+    BOOST_CHECK(!utxo_set.HasUTXO(blk100_tx1, 0));
+    BOOST_CHECK(!utxo_set.HasUTXO(blk100_tx1, 1));
+    BOOST_CHECK(!utxo_set.HasUTXO(blk101_cb, 0));
+    BOOST_CHECK(!utxo_set.HasUTXO(blk101_tx2, 0));
+    BOOST_CHECK(!utxo_set.HasUTXO(blk102_cb, 0));
+    BOOST_CHECK(!utxo_set.HasUTXO(blk102_tx2, 0));
+}
+
+BOOST_AUTO_TEST_CASE(gpu_reorg_6_blocks_with_chains)
+{
+    // Simulate a 6-block reorg with chained spends
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(2 * 1024 * 1024));
+
+    uint8_t script[25] = { 0x76, 0xa9, 0x14 };
+    memset(&script[3], 0xCC, 20);
+    script[23] = 0x88;
+    script[24] = 0xac;
+
+    ::gpu::UTXOHeader header;
+    header.script_size = 25;
+    header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2PKH);
+    memset(header.padding, 0, sizeof(header.padding));
+
+    // Create chain of 6 blocks with spending
+    std::vector<uint256> coinbases(6);
+    std::vector<uint256> regular_txs(6);
+
+    for (int blk = 0; blk < 6; blk++) {
+        memset(coinbases[blk].data(), static_cast<uint8_t>(0xD0 + blk), 32);
+        memset(regular_txs[blk].data(), static_cast<uint8_t>(0xE0 + blk), 32);
+
+        // Coinbase
+        header.blockHeight = 200 + static_cast<uint32_t>(blk);
+        header.flags = ::gpu::UTXO_FLAG_COINBASE;
+        header.amount = 50 * 100000000ULL;
+        header.vout = 0;
+        BOOST_CHECK(utxo_set.AddUTXO(coinbases[blk], 0, header, script));
+
+        // Regular tx spends previous block's regular tx (if exists) or first coinbase
+        if (blk > 0) {
+            BOOST_CHECK(utxo_set.SpendUTXO(regular_txs[blk - 1], 0));
+        } else {
+            // First block spends some pre-existing UTXO (just add output)
+        }
+
+        header.flags = 0;
+        header.amount = static_cast<uint64_t>(49 - blk) * 100000000ULL;
+        BOOST_CHECK(utxo_set.AddUTXO(regular_txs[blk], 0, header, script));
+    }
+
+    // Verify chain state
+    for (int blk = 0; blk < 6; blk++) {
+        BOOST_CHECK(utxo_set.HasUTXO(coinbases[blk], 0));
+    }
+    BOOST_CHECK(utxo_set.HasUTXO(regular_txs[5], 0));  // Last is unspent
+    for (int blk = 0; blk < 5; blk++) {
+        BOOST_CHECK(!utxo_set.HasUTXO(regular_txs[blk], 0));  // Others are spent
+    }
+
+    // Disconnect all 6 blocks in reverse order
+    for (int blk = 5; blk >= 0; blk--) {
+        utxo_set.BeginBatchUpdate();
+
+        // Remove outputs created by this block
+        utxo_set.RemoveUTXO(coinbases[blk], 0);
+        utxo_set.RemoveUTXO(regular_txs[blk], 0);
+
+        // Restore spent input (previous block's regular tx)
+        if (blk > 0) {
+            header.blockHeight = 200 + static_cast<uint32_t>(blk - 1);
+            header.flags = 0;
+            header.amount = static_cast<uint64_t>(49 - (blk - 1)) * 100000000ULL;
+            header.vout = 0;
+            utxo_set.RestoreUTXO(regular_txs[blk - 1], 0, header, script);
+        }
+
+        BOOST_CHECK(utxo_set.CommitBatchUpdate());
+    }
+
+    // Verify all disconnected
+    for (int blk = 0; blk < 6; blk++) {
+        BOOST_CHECK(!utxo_set.HasUTXO(coinbases[blk], 0));
+        BOOST_CHECK(!utxo_set.HasUTXO(regular_txs[blk], 0));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(gpu_reorg_deep_50_blocks)
+{
+    // Simulate a deep 50-block reorg (stress test)
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(8 * 1024 * 1024));  // 8MB for this test
+
+    uint8_t script[34] = { 0x51, 0x20 };  // P2TR prefix
+    memset(&script[2], 0xDD, 32);
+
+    ::gpu::UTXOHeader header;
+    header.script_size = 34;
+    header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2TR);
+    header.flags = 0;
+    memset(header.padding, 0, sizeof(header.padding));
+
+    const int NUM_BLOCKS = 50;
+    std::vector<uint256> block_coinbases(NUM_BLOCKS);
+
+    // Connect 50 blocks
+    for (int blk = 0; blk < NUM_BLOCKS; blk++) {
+        memset(block_coinbases[blk].data(), static_cast<uint8_t>((blk % 256)), 32);
+        block_coinbases[blk].data()[31] = static_cast<uint8_t>(blk / 256);
+
+        header.blockHeight = 1000 + static_cast<uint32_t>(blk);
+        header.flags = ::gpu::UTXO_FLAG_COINBASE;
+        header.amount = 50 * 100000000ULL;
+        header.vout = 0;
+
+        BOOST_CHECK(utxo_set.AddUTXO(block_coinbases[blk], 0, header, script));
+    }
+
+    size_t count_before = utxo_set.GetNumUTXOs();
+    BOOST_CHECK_EQUAL(count_before, static_cast<size_t>(NUM_BLOCKS));
+
+    // Disconnect all 50 blocks in reverse
+    for (int blk = NUM_BLOCKS - 1; blk >= 0; blk--) {
+        utxo_set.BeginBatchUpdate();
+        utxo_set.RemoveUTXO(block_coinbases[blk], 0);
+        BOOST_CHECK(utxo_set.CommitBatchUpdate());
+    }
+
+    // All should be gone
+    for (int blk = 0; blk < NUM_BLOCKS; blk++) {
+        BOOST_CHECK(!utxo_set.HasUTXO(block_coinbases[blk], 0));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(gpu_reorg_batch_abort_rollback)
+{
+    // Test that aborting mid-batch correctly rolls back
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    uint8_t script[25] = { 0x76, 0xa9, 0x14 };
+    memset(&script[3], 0xEE, 20);
+    script[23] = 0x88;
+    script[24] = 0xac;
+
+    // Add some UTXOs
+    for (int i = 0; i < 5; i++) {
+        uint256 txid;
+        memset(txid.data(), static_cast<uint8_t>(0xF0 + i), 32);
+
+        ::gpu::UTXOHeader header;
+        header.amount = static_cast<uint64_t>((i + 1)) * 100000000ULL;
+        header.blockHeight = 800;
+        header.script_size = 25;
+        header.vout = 0;
+        header.flags = 0;
+        header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2PKH);
+        memset(header.padding, 0, sizeof(header.padding));
+
+        BOOST_CHECK(utxo_set.AddUTXO(txid, 0, header, script));
+    }
+
+    size_t count_before = utxo_set.GetNumUTXOs();
+    BOOST_CHECK_EQUAL(count_before, 5u);
+
+    // Start a batch but abort it
+    utxo_set.BeginBatchUpdate();
+
+    // Stage some removals
+    for (int i = 0; i < 3; i++) {
+        uint256 txid;
+        memset(txid.data(), static_cast<uint8_t>(0xF0 + i), 32);
+        utxo_set.RemoveUTXO(txid, 0);
+    }
+
+    // Abort!
+    utxo_set.AbortBatchUpdate();
+
+    // All UTXOs should still be there (abort rolled back the batch)
+    for (int i = 0; i < 5; i++) {
+        uint256 txid;
+        memset(txid.data(), static_cast<uint8_t>(0xF0 + i), 32);
+        BOOST_CHECK(utxo_set.HasUTXO(txid, 0));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(gpu_get_utxo_including_spent)
+{
+    // Test GetUTXOIncludingSpent for undo operations
+    ::gpu::GPUUTXOSet utxo_set;
+    BOOST_CHECK(utxo_set.Initialize(1024 * 1024));
+
+    uint256 txid;
+    memset(txid.data(), 0x77, 32);
+
+    ::gpu::UTXOHeader header;
+    header.amount = 100 * 100000000ULL;
+    header.blockHeight = 900;
+    header.script_size = 22;
+    header.vout = 0;
+    header.flags = 0;
+    header.script_type = static_cast<uint8_t>(::gpu::SCRIPT_TYPE_P2WPKH);
+    memset(header.padding, 0, sizeof(header.padding));
+
+    uint8_t script[22] = { 0x00, 0x14 };
+    memset(&script[2], 0x88, 20);
+
+    // Add and spend
+    BOOST_CHECK(utxo_set.AddUTXO(txid, 0, header, script));
+    BOOST_CHECK(utxo_set.HasUTXO(txid, 0));
+    BOOST_CHECK(utxo_set.SpendUTXO(txid, 0));
+    BOOST_CHECK(!utxo_set.HasUTXO(txid, 0));
+
+    // Should still be retrievable via GetUTXOIncludingSpent
+    ::gpu::UTXOHeader retrieved;
+    uint8_t retrieved_script[22];
+    BOOST_CHECK(utxo_set.GetUTXOIncludingSpent(txid, 0, retrieved, retrieved_script));
+    BOOST_CHECK_EQUAL(retrieved.amount, header.amount);
+    BOOST_CHECK_EQUAL(retrieved.blockHeight, header.blockHeight);
+    BOOST_CHECK(retrieved.flags & ::gpu::UTXO_FLAG_SPENT);
+}
+
 #else // !ENABLE_GPU_ACCELERATION
 
 BOOST_AUTO_TEST_CASE(gpu_disabled_check)
