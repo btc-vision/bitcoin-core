@@ -52,21 +52,23 @@ BOOST_FIXTURE_TEST_CASE(gpu_crypto_basic_test, BasicTestingSetup)
 
 BOOST_FIXTURE_TEST_CASE(gpu_siphash_cpu_test, BasicTestingSetup)
 {
-    // Test SipHash on CPU
+    // Test SipHash on CPU using PresaltedSipHasher
     for (int i = 0; i < 10; i++) {
         uint64_t k0 = m_rng.rand64();
         uint64_t k1 = m_rng.rand64();
         uint256 test_val = GetRandHash();
-        
-        uint64_t hash = SipHashUint256(k0, k1, test_val);
+
+        PresaltedSipHasher hasher(k0, k1);
+        uint64_t hash = hasher(test_val);
         BOOST_CHECK(hash != 0);
-        
+
         // Same input should give same output
-        uint64_t hash2 = SipHashUint256(k0, k1, test_val);
+        uint64_t hash2 = hasher(test_val);
         BOOST_CHECK_EQUAL(hash, hash2);
-        
+
         // Different keys should give different output
-        uint64_t hash3 = SipHashUint256(k0 + 1, k1, test_val);
+        PresaltedSipHasher hasher2(k0 + 1, k1);
+        uint64_t hash3 = hasher2(test_val);
         BOOST_CHECK(hash != hash3);
     }
 }

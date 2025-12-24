@@ -12,8 +12,9 @@ namespace gpu {
 // SHA-256 Implementation
 // ============================================================================
 
-// SHA-256 constants - use static to avoid multiple definitions
-static __device__ __constant__ uint32_t K256[64] = {
+// SHA-256 constants - available on both host and device
+// Note: On device, this will be placed in constant memory by the compiler when appropriate
+__device__ __host__ static constexpr uint32_t K256[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -32,45 +33,54 @@ static __device__ __constant__ uint32_t K256[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-// Optimized rotate right using funnel shift
-__device__ __forceinline__ uint32_t rotr(uint32_t x, uint32_t n) {
+// Optimized rotate right using funnel shift (with fallback for non-CUDA)
+__device__ __host__ __forceinline__ uint32_t rotr(uint32_t x, uint32_t n) {
+#if defined(__CUDA_ARCH__)
     return __funnelshift_r(x, x, n);
+#else
+    return (x >> n) | (x << (32 - n));
+#endif
 }
 
 // SHA-256 functions
-__device__ __forceinline__ uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
+__device__ __host__ __forceinline__ uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (~x & z);
 }
 
-__device__ __forceinline__ uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) {
+__device__ __host__ __forceinline__ uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (x & z) ^ (y & z);
 }
 
-__device__ __forceinline__ uint32_t Sigma0(uint32_t x) {
+__device__ __host__ __forceinline__ uint32_t Sigma0(uint32_t x) {
     return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
 }
 
-__device__ __forceinline__ uint32_t Sigma1(uint32_t x) {
+__device__ __host__ __forceinline__ uint32_t Sigma1(uint32_t x) {
     return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
 }
 
-__device__ __forceinline__ uint32_t sigma0(uint32_t x) {
+__device__ __host__ __forceinline__ uint32_t sigma0(uint32_t x) {
     return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
 }
 
-__device__ __forceinline__ uint32_t sigma1(uint32_t x) {
+__device__ __host__ __forceinline__ uint32_t sigma1(uint32_t x) {
     return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
 }
 
 // Byte swap for endianness
-__device__ __forceinline__ uint32_t bswap32(uint32_t x) {
+__device__ __host__ __forceinline__ uint32_t bswap32(uint32_t x) {
+#if defined(__CUDA_ARCH__)
     uint32_t result;
     asm("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(result) : "r"(x));
     return result;
+#else
+    return ((x >> 24) & 0xFF) | ((x >> 8) & 0xFF00) |
+           ((x << 8) & 0xFF0000) | ((x << 24) & 0xFF000000);
+#endif
 }
 
 // SHA-256 compression function
-__device__ inline void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
+__device__ __host__ inline void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
     uint32_t W[64];
     uint32_t a, b, c, d, e, f, g, h;
     
@@ -104,7 +114,7 @@ __device__ inline void sha256_transform(uint32_t state[8], const uint8_t block[6
 }
 
 // Full SHA-256 hash function
-__device__ inline void sha256(const uint8_t* data, size_t len, uint8_t* hash) {
+__device__ __host__ inline void sha256(const uint8_t* data, size_t len, uint8_t* hash) {
     uint32_t state[8] = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
@@ -158,7 +168,7 @@ __device__ inline void sha256(const uint8_t* data, size_t len, uint8_t* hash) {
 }
 
 // Double SHA-256 (Bitcoin's proof-of-work)
-__device__ inline void sha256d(const uint8_t* data, size_t len, uint8_t* hash) {
+__device__ __host__ inline void sha256d(const uint8_t* data, size_t len, uint8_t* hash) {
     uint8_t first_hash[32];
     sha256(data, len, first_hash);
     sha256(first_hash, 32, hash);

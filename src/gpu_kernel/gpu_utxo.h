@@ -28,14 +28,19 @@ struct UTXOHeader {
 static_assert(sizeof(UTXOHeader) == 32, "UTXOHeader must be exactly 32 bytes");
 
 // Script types for fast validation paths
+// Matches Bitcoin Core's TxoutType in script/solver.h
 enum ScriptType : uint8_t {
     SCRIPT_TYPE_UNKNOWN = 0,
-    SCRIPT_TYPE_P2PKH = 1,
-    SCRIPT_TYPE_P2WPKH = 2,
-    SCRIPT_TYPE_P2SH = 3,
-    SCRIPT_TYPE_P2WSH = 4,
-    SCRIPT_TYPE_P2TR = 5,
-    SCRIPT_TYPE_NONSTANDARD = 255
+    SCRIPT_TYPE_P2PKH = 1,       // OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    SCRIPT_TYPE_P2WPKH = 2,      // OP_0 <20 bytes>
+    SCRIPT_TYPE_P2SH = 3,        // OP_HASH160 <20> OP_EQUAL
+    SCRIPT_TYPE_P2WSH = 4,       // OP_0 <32 bytes>
+    SCRIPT_TYPE_P2TR = 5,        // OP_1 <32 bytes>
+    SCRIPT_TYPE_P2PK = 6,        // <pubkey> OP_CHECKSIG (33 or 65 byte pubkey)
+    SCRIPT_TYPE_MULTISIG = 7,    // OP_M <pubkey>... OP_N OP_CHECKMULTISIG
+    SCRIPT_TYPE_NULL_DATA = 8,   // OP_RETURN <data> (provably unspendable)
+    SCRIPT_TYPE_WITNESS_UNKNOWN = 9, // OP_N <2-40 bytes> where N >= 2
+    SCRIPT_TYPE_NONSTANDARD = 255    // Any other valid script
 };
 
 // Flags for UTXO status
@@ -69,7 +74,38 @@ public:
     // Update operations
     bool AddUTXO(const uint256& txid, uint32_t vout, const UTXOHeader& header, const uint8_t* scriptData);
     bool SpendUTXO(const uint256& txid, uint32_t vout);
-    
+
+    // =========================================================================
+    // Batch operations for atomic reorg handling (Phase 8)
+    // =========================================================================
+
+    // Begin a batch update transaction - all subsequent operations are staged
+    void BeginBatchUpdate();
+
+    // Commit all staged changes atomically
+    bool CommitBatchUpdate();
+
+    // Abort batch update and discard all staged changes
+    void AbortBatchUpdate();
+
+    // Check if we're in a batch update
+    bool IsInBatchUpdate() const { return m_batch_active; }
+
+    // =========================================================================
+    // Reorg-specific operations (Phase 8)
+    // =========================================================================
+
+    // Completely remove a UTXO (used when disconnecting blocks)
+    // Different from SpendUTXO which just marks as spent
+    bool RemoveUTXO(const uint256& txid, uint32_t vout);
+
+    // Restore a spent UTXO from undo data (used when disconnecting blocks)
+    // This unmarks the UTXO as spent and restores it to the hash table
+    bool RestoreUTXO(const uint256& txid, uint32_t vout, const UTXOHeader& header, const uint8_t* scriptData);
+
+    // Get UTXO even if spent (for undo operations)
+    bool GetUTXOIncludingSpent(const uint256& txid, uint32_t vout, UTXOHeader& header, uint8_t* scriptData = nullptr) const;
+
     // Memory management
     size_t GetVRAMUsage() const { return totalVRAMUsed; }
     size_t GetFreeSpace() const { return totalFreeSpace; }
