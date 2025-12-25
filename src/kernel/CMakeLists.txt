@@ -92,6 +92,7 @@ target_link_libraries(bitcoinkernel
     secp256k1_objs
     $<$<PLATFORM_ID:Windows>:bcrypt>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
+    $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:bitcoin_kernel_gpu>
   PUBLIC
     Boost::headers
 )

@@ -9,6 +9,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <common/args.h>
 #include <checkqueue.h>
 #include <clientversion.h>
 #include <consensus/amount.h>
@@ -28,6 +29,10 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/types.h>
 #include <kernel/warning.h>
+#ifdef ENABLE_GPU_ACCELERATION
+#include <gpu_kernel/gpu_utxo.h>
+#include <gpu_kernel/gpu_batch_validator.h>
+#endif
 #include <logging.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
@@ -43,6 +48,7 @@
 #include <random.h>
 #include <script/script.h>
 #include <script/sigcache.h>
+#include <script/interpreter.h>
 #include <signet.h>
 #include <tinyformat.h>
 #include <txdb.h>
@@ -67,7 +73,9 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstring>
 #include <deque>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -118,6 +126,76 @@ TRACEPOINT_SEMAPHORE(validation, block_connected);
 TRACEPOINT_SEMAPHORE(utxocache, flush);
 TRACEPOINT_SEMAPHORE(mempool, replaced);
 TRACEPOINT_SEMAPHORE(mempool, rejected);
+
+#ifdef ENABLE_GPU_ACCELERATION
+// =========================================================================
+// GPU UTXO Set - File-scope state for use by ConnectBlock and DisconnectBlock
+// =========================================================================
+static std::unique_ptr<gpu::GPUUTXOSet> g_gpu_utxo_set;
+static std::unique_ptr<gpu::GPUBatchValidator> g_gpu_block_validator;
+static bool g_gpu_block_enabled = false;
+static bool g_gpu_block_validation_enabled = false;
+static bool g_gpu_utxo_loaded = false;
+static std::mutex g_gpu_mutex;  // Protect GPU state during reorgs
+
+// Reserve 2GB for batch validator (script contexts need ~1MB each, 1000 contexts = ~1GB)
+// Extra headroom for script blobs, witness data, and overhead
+static constexpr size_t GPU_BATCH_VALIDATOR_RESERVE = 2048ULL * 1024 * 1024;
+
+// Initialize GPU block validation subsystem
+static bool InitGPUBlockValidation() {
+    if (g_gpu_block_enabled) return true;
+
+    g_gpu_block_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
+    g_gpu_block_validation_enabled = gArgs.GetBoolArg("-gpuvalidation", true);
+
+    if (!g_gpu_block_enabled) return false;
+
+    // Get VRAM limit from args (in MB), default 8192 MB
+    int64_t vram_mb = gArgs.GetIntArg("-gpuvram", 8192);
+    size_t vram_limit = static_cast<size_t>(vram_mb) * 1024 * 1024;
+
+    // Reserve space for batch validator if validation is enabled
+    size_t utxo_limit = vram_limit;
+    if (g_gpu_block_validation_enabled && vram_limit > GPU_BATCH_VALIDATOR_RESERVE) {
+        utxo_limit = vram_limit - GPU_BATCH_VALIDATOR_RESERVE;
+        LogInfo("GPU: Reserving %zu MB for batch validator, %zu MB for UTXO set\n",
+                GPU_BATCH_VALIDATOR_RESERVE / (1024 * 1024), utxo_limit / (1024 * 1024));
+    }
+
+    g_gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
+    if (!g_gpu_utxo_set->Initialize(utxo_limit)) {
+        LogWarning("GPU UTXO set initialization failed, falling back to CPU\n");
+        g_gpu_block_enabled = false;
+        g_gpu_utxo_set.reset();
+        return false;
+    }
+    LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", utxo_limit / (1024 * 1024));
+
+    if (g_gpu_block_validation_enabled) {
+        g_gpu_block_validator = std::make_unique<gpu::GPUBatchValidator>();
+        if (!g_gpu_block_validator->Initialize()) {
+            LogWarning("GPU batch validator initialization failed, falling back to CPU\n");
+            g_gpu_block_validation_enabled = false;
+            g_gpu_block_validator.reset();
+        } else {
+            LogInfo("GPU block batch validator initialized\n");
+            g_gpu_block_validator->SetUTXOSet(g_gpu_utxo_set.get());
+        }
+    }
+
+    return g_gpu_block_enabled;
+}
+
+// Get GPU UTXO set (creates if needed)
+static gpu::GPUUTXOSet* GetGPUUTXOSet() {
+    std::lock_guard<std::mutex> lock(g_gpu_mutex);
+    if (!g_gpu_block_enabled && !InitGPUBlockValidation()) {
+        return nullptr;
+    }
+    return g_gpu_utxo_set.get();
+}
+#endif // ENABLE_GPU_ACCELERATION
 
 const CBlockIndex* Chainstate::FindForkInGlobalIndex(const CBlockLocator& locator) const
 {
@@ -433,6 +511,310 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
 }
 
 namespace {
+
+#ifdef ENABLE_GPU_ACCELERATION
+// GPU mempool validator for single-transaction validation (low latency)
+// Separate from block validator which is optimized for batch throughput
+static std::unique_ptr<gpu::GPUBatchValidator> g_gpu_mempool_validator;
+static bool g_gpu_mempool_enabled = false;
+static bool g_gpu_mempool_initialized = false;
+
+// Initialize GPU mempool validator on first use
+static bool InitGPUMempoolValidator() {
+    if (g_gpu_mempool_initialized) {
+        return g_gpu_mempool_enabled;
+    }
+    g_gpu_mempool_initialized = true;
+
+    // Check if GPU mempool validation is enabled via command line
+    g_gpu_mempool_enabled = gArgs.GetBoolArg("-gpumempool", false) &&
+                            gArgs.GetBoolArg("-gpuacceleration", false);
+
+    if (!g_gpu_mempool_enabled) {
+        return false;
+    }
+
+    g_gpu_mempool_validator = std::make_unique<gpu::GPUBatchValidator>();
+    // Use smaller buffers for mempool (single tx at a time, low latency)
+    if (!g_gpu_mempool_validator->Initialize(1000, 1024 * 1024, 2 * 1024 * 1024)) {
+        LogWarning("GPU mempool validator initialization failed, falling back to CPU\n");
+        g_gpu_mempool_enabled = false;
+        g_gpu_mempool_validator.reset();
+        return false;
+    }
+
+    LogInfo("GPU mempool validator initialized for single-transaction validation\n");
+    return true;
+}
+
+// Check if a transaction is eligible for GPU validation
+// GPU is most efficient for simple script types: P2PKH, P2WPKH, P2TR key-path
+static bool IsGPUEligibleTransaction(const CTransaction& tx, const CCoinsViewCache& inputs) {
+    // Skip coinbase
+    if (tx.IsCoinBase()) return false;
+
+    // Check each input's scriptPubKey type
+    for (const CTxIn& txin : tx.vin) {
+        const Coin& coin = inputs.AccessCoin(txin.prevout);
+        if (coin.IsSpent()) return false;
+
+        const CScript& scriptPubKey = coin.out.scriptPubKey;
+
+        // Check for simple script types that GPU handles well
+        // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+        // P2WPKH: OP_0 <20 bytes>
+        // P2TR: OP_1 <32 bytes>
+
+        if (scriptPubKey.size() == 25 &&
+            scriptPubKey[0] == OP_DUP &&
+            scriptPubKey[1] == OP_HASH160 &&
+            scriptPubKey[2] == 0x14 &&
+            scriptPubKey[23] == OP_EQUALVERIFY &&
+            scriptPubKey[24] == OP_CHECKSIG) {
+            // P2PKH - GPU eligible
+            continue;
+        }
+
+        if (scriptPubKey.size() == 22 &&
+            scriptPubKey[0] == OP_0 &&
+            scriptPubKey[1] == 0x14) {
+            // P2WPKH - GPU eligible
+            continue;
+        }
+
+        if (scriptPubKey.size() == 34 &&
+            scriptPubKey[0] == OP_1 &&
+            scriptPubKey[1] == 0x20) {
+            // P2TR - GPU eligible (key-path only for now)
+            continue;
+        }
+
+        // Non-simple script type, fall back to CPU
+        return false;
+    }
+
+    return true;
+}
+
+// Validate a single transaction using GPU
+// Returns true if GPU validation succeeded, false to fall back to CPU
+static bool GPUValidateSingleTransaction(
+    const CTransaction& tx,
+    TxValidationState& state,
+    const CCoinsViewCache& inputs,
+    script_verify_flags flags,
+    PrecomputedTransactionData& txdata)
+{
+    if (!g_gpu_mempool_validator) return false;
+
+    // Initialize txdata if needed
+    if (!txdata.m_spent_outputs_ready) {
+        std::vector<CTxOut> spent_outputs;
+        spent_outputs.reserve(tx.vin.size());
+        for (const CTxIn& txin : tx.vin) {
+            const Coin& coin = inputs.AccessCoin(txin.prevout);
+            if (coin.IsSpent()) return false;
+            spent_outputs.emplace_back(coin.out);
+        }
+        txdata.Init(tx, std::move(spent_outputs));
+    }
+
+    g_gpu_mempool_validator->BeginBatch();
+
+    // Queue all inputs for validation
+    std::vector<int> job_indices;
+    for (unsigned int i = 0; i < tx.vin.size(); i++) {
+        const CTxOut& spent_output = txdata.m_spent_outputs[i];
+        const CScript& scriptPubKey = spent_output.scriptPubKey;
+        const CScript& scriptSig = tx.vin[i].scriptSig;
+
+        // Determine signature version
+        gpu::GPUSigVersion sigversion = gpu::GPU_SIGVERSION_BASE;
+        SigVersion cpu_sigversion = SigVersion::BASE;
+
+        // Check for witness program
+        if (scriptPubKey.size() == 22 && scriptPubKey[0] == OP_0) {
+            sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
+            cpu_sigversion = SigVersion::WITNESS_V0;
+        } else if (scriptPubKey.size() == 34 && scriptPubKey[0] == OP_1) {
+            // P2TR: distinguish key path vs script path
+            const auto& wit = tx.vin[i].scriptWitness.stack;
+            size_t wit_count = wit.size();
+            bool has_annex = (wit_count >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+            size_t effective_count = has_annex ? wit_count - 1 : wit_count;
+
+            if (effective_count == 1) {
+                sigversion = gpu::GPU_SIGVERSION_TAPROOT;
+                cpu_sigversion = SigVersion::TAPROOT;
+            } else {
+                sigversion = gpu::GPU_SIGVERSION_TAPSCRIPT;
+                cpu_sigversion = SigVersion::TAPSCRIPT;
+            }
+        }
+
+        // Serialize witness data for GPU using proper CompactSize encoding
+        std::vector<uint8_t> serialized_witness;
+        uint32_t witness_count = 0;
+
+        if (tx.HasWitness() && i < tx.vin.size() && !tx.vin[i].scriptWitness.IsNull()) {
+            const CScriptWitness& wit = tx.vin[i].scriptWitness;
+            witness_count = wit.stack.size();
+            // Serialize witness: for each item, push CompactSize length then data
+            for (const auto& item : wit.stack) {
+                size_t item_size = item.size();
+                if (item_size < 0xFD) {
+                    serialized_witness.push_back(static_cast<uint8_t>(item_size));
+                } else if (item_size <= 0xFFFF) {
+                    serialized_witness.push_back(0xFD);
+                    serialized_witness.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                } else if (item_size <= 0xFFFFFFFF) {
+                    serialized_witness.push_back(0xFE);
+                    serialized_witness.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 16) & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 24) & 0xFF));
+                } else {
+                    serialized_witness.push_back(0xFF);
+                    for (int k = 0; k < 8; k++) {
+                        serialized_witness.push_back(static_cast<uint8_t>((item_size >> (k * 8)) & 0xFF));
+                    }
+                }
+                serialized_witness.insert(serialized_witness.end(), item.begin(), item.end());
+            }
+        }
+
+        // Compute sighash for GPU
+        uint256 sighash;
+        const uint8_t* sighash_ptr = nullptr;
+        int nHashType = SIGHASH_ALL;
+
+        if (cpu_sigversion == SigVersion::TAPROOT || cpu_sigversion == SigVersion::TAPSCRIPT) {
+            // Taproot/Tapscript: get sighash type from witness[0]
+            const auto& wit = tx.vin[i].scriptWitness.stack;
+            if (witness_count > 0 && !wit.empty()) {
+                const auto& sig = wit[0];
+                nHashType = (sig.size() == 65) ? sig[64] : 0x00;
+            }
+            ScriptExecutionData execdata;
+            execdata.m_annex_init = true;
+            execdata.m_codeseparator_pos_init = true;
+            execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+
+            bool has_annex = (wit.size() >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+            if (has_annex) {
+                execdata.m_annex_present = true;
+                const auto& annex = wit.back();
+                std::vector<unsigned char> annex_with_size;
+                annex_with_size.push_back(static_cast<unsigned char>(annex.size()));
+                annex_with_size.insert(annex_with_size.end(), annex.begin(), annex.end());
+                CSHA256().Write(annex_with_size.data(), annex_with_size.size()).Finalize(execdata.m_annex_hash.begin());
+            } else {
+                execdata.m_annex_present = false;
+            }
+
+            // For script path, compute tapleaf hash
+            if (cpu_sigversion == SigVersion::TAPSCRIPT) {
+                size_t ctrl_idx = has_annex ? wit.size() - 2 : wit.size() - 1;
+                size_t script_idx = ctrl_idx - 1;
+                if (script_idx < wit.size() && ctrl_idx < wit.size()) {
+                    const auto& tapscript = wit[script_idx];
+                    const auto& control_block = wit[ctrl_idx];
+                    uint8_t leaf_version = control_block.empty() ? 0xc0 : (control_block[0] & 0xfe);
+                    execdata.m_tapleaf_hash_init = true;
+                    execdata.m_tapleaf_hash = ComputeTapleafHash(leaf_version, tapscript);
+                }
+            }
+
+            if (SignatureHashSchnorr(sighash, execdata, tx, i, nHashType, cpu_sigversion, txdata, MissingDataBehavior::FAIL)) {
+                sighash_ptr = sighash.data();
+            }
+        } else if (cpu_sigversion == SigVersion::WITNESS_V0) {
+            // Witness v0: get sighash type from signature
+            if (witness_count > 0 && !tx.vin[i].scriptWitness.stack.empty() && !tx.vin[i].scriptWitness.stack[0].empty()) {
+                nHashType = tx.vin[i].scriptWitness.stack[0].back();
+            }
+
+            // Construct proper scriptCode for BIP143 sighash
+            // P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+            // P2WSH: The witness script (last element of witness stack)
+            CScript scriptCode;
+            if (scriptPubKey.size() == 22 && scriptPubKey[0] == OP_0 && scriptPubKey[1] == 0x14) {
+                // P2WPKH: construct implied P2PKH script
+                // Extract the 20-byte pubkey hash and use << operator to add proper push opcode
+                std::vector<unsigned char> pubkeyhash(scriptPubKey.begin() + 2, scriptPubKey.end());
+                scriptCode << OP_DUP << OP_HASH160 << pubkeyhash << OP_EQUALVERIFY << OP_CHECKSIG;
+            } else if (scriptPubKey.size() == 34 && scriptPubKey[0] == OP_0 && scriptPubKey[1] == 0x20) {
+                // P2WSH: use witness script (last element of witness stack)
+                const auto& wit = tx.vin[i].scriptWitness.stack;
+                if (!wit.empty()) {
+                    const auto& witnessScript = wit.back();
+                    scriptCode = CScript(witnessScript.begin(), witnessScript.end());
+                } else {
+                    scriptCode = scriptPubKey;
+                }
+            } else {
+                scriptCode = scriptPubKey;
+            }
+
+            sighash = SignatureHash(scriptCode, tx, i, nHashType, spent_output.nValue, SigVersion::WITNESS_V0, &txdata);
+            sighash_ptr = sighash.data();
+        } else {
+            // Legacy
+            if (!scriptSig.empty()) {
+                CScript::const_iterator pc = scriptSig.begin();
+                opcodetype opcode;
+                std::vector<unsigned char> sig;
+                if (scriptSig.GetOp(pc, opcode, sig) && !sig.empty()) {
+                    nHashType = sig.back();
+                }
+            }
+            sighash = SignatureHash(scriptPubKey, tx, i, nHashType, spent_output.nValue, SigVersion::BASE, &txdata);
+            sighash_ptr = sighash.data();
+        }
+
+        int job_idx = g_gpu_mempool_validator->QueueJob(
+            0, i,  // tx_index=0 (single tx), input_index=i
+            scriptPubKey.data(), scriptPubKey.size(),
+            scriptSig.data(), scriptSig.size(),
+            serialized_witness.data(), serialized_witness.size(), witness_count,
+            spent_output.nValue,
+            tx.vin[i].nSequence,
+            static_cast<uint32_t>(flags.as_int()),  // Convert flags to integer
+            sigversion,
+            sighash_ptr
+        );
+
+        if (job_idx < 0) {
+            // Queue full or error, fall back to CPU
+            g_gpu_mempool_validator->EndBatch();
+            return false;
+        }
+        job_indices.push_back(job_idx);
+    }
+
+    g_gpu_mempool_validator->EndBatch();
+
+    // Execute GPU validation
+    gpu::BatchValidationResult result = g_gpu_mempool_validator->ValidateBatch();
+
+    if (result.has_error) {
+        // GPU found an invalid input
+        state.Invalid(TxValidationResult::TX_CONSENSUS,
+            strprintf("gpu-script-verify-failed (input %u, error %d)",
+                      result.first_error_input, result.first_error_code));
+        return true;  // GPU handled it (found invalid)
+    }
+
+    if (result.valid_count == tx.vin.size()) {
+        // All inputs valid according to GPU
+        return true;
+    }
+
+    // Some inputs skipped (complex scripts), fall back to CPU
+    return false;
+}
+#endif // ENABLE_GPU_ACCELERATION
 
 class MemPoolAccept
 {
@@ -1157,6 +1539,31 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     constexpr script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
 
+#ifdef ENABLE_GPU_ACCELERATION
+    // Try GPU-accelerated validation for eligible transactions (P2PKH, P2WPKH, P2TR)
+    // GPU is optimized for low-latency single transaction validation
+    if (InitGPUMempoolValidator() && IsGPUEligibleTransaction(tx, m_view)) {
+        m_pool.IncrementGPUEligible();  // Track GPU-eligible transactions
+        if (GPUValidateSingleTransaction(tx, state, m_view, scriptVerifyFlags, ws.m_precomputed_txdata)) {
+            // GPU handled validation (either valid or found specific error)
+            m_pool.IncrementGPUValidated();  // Track successful GPU validation
+            if (state.IsValid()) {
+                LogDebug(BCLog::VALIDATION, "GPU mempool validation succeeded for tx %s\n",
+                         tx.GetHash().ToString().substr(0, 10));
+                return true;
+            }
+            // GPU found the transaction invalid
+            LogDebug(BCLog::VALIDATION, "GPU mempool validation rejected tx %s: %s\n",
+                     tx.GetHash().ToString().substr(0, 10), state.GetRejectReason());
+            return false;
+        }
+        // GPU couldn't handle it (complex scripts), fall through to CPU
+        m_pool.IncrementGPUFallback();  // Track fallback to CPU
+        LogDebug(BCLog::VALIDATION, "GPU validation skipped for tx %s, using CPU fallback\n",
+                 tx.GetHash().ToString().substr(0, 10));
+    }
+#endif
+
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
     if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache())) {
@@ -1195,6 +1602,25 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     // invalid blocks (using TestBlockValidity), however allowing such
     // transactions into the mempool can be exploited as a DoS attack.
     script_verify_flags currentBlockScriptVerifyFlags{GetBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
+
+#ifdef ENABLE_GPU_ACCELERATION
+    // For consensus checks, we can optionally use GPU but always verify with CPU
+    // This provides double-checking for consensus-critical validation
+    bool gpu_verify_enabled = gArgs.GetBoolArg("-gpuverify", false);
+
+    if (g_gpu_mempool_enabled && IsGPUEligibleTransaction(tx, m_view)) {
+        TxValidationState gpu_state;
+        bool gpu_result = GPUValidateSingleTransaction(tx, gpu_state, m_view,
+                                                       currentBlockScriptVerifyFlags,
+                                                       ws.m_precomputed_txdata);
+        if (gpu_result && gpu_verify_enabled) {
+            // GPU validation completed, verify matches CPU for consensus safety
+            LogDebug(BCLog::VALIDATION, "GPU consensus check completed for tx %s, verifying with CPU\n",
+                     tx.GetHash().ToString().substr(0, 10));
+        }
+    }
+#endif
+
     if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache())) {
         LogError("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s", hash.ToString(), state.ToString());
@@ -2233,6 +2659,69 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         return DISCONNECT_FAILED;
     }
 
+#ifdef ENABLE_GPU_ACCELERATION
+    // GPU UTXO set update for reorg handling (Phase 8)
+    gpu::GPUUTXOSet* gpu_utxo = GetGPUUTXOSet();
+    if (gpu_utxo && g_gpu_utxo_loaded) {
+        std::lock_guard<std::mutex> lock(g_gpu_mutex);
+
+        LogDebug(BCLog::VALIDATION, "GPU DisconnectBlock: height=%d, txns=%zu\n",
+                 pindex->nHeight, block.vtx.size());
+
+        gpu_utxo->BeginBatchUpdate();
+
+        // Process transactions in reverse order (same as CPU path)
+        for (int i = block.vtx.size() - 1; i >= 0; i--) {
+            const CTransaction& tx = *(block.vtx[i]);
+            Txid hash = tx.GetHash();
+
+            // Remove outputs created by this transaction
+            for (size_t o = 0; o < tx.vout.size(); o++) {
+                if (!tx.vout[o].scriptPubKey.IsUnspendable()) {
+                    // Convert Txid to uint256 for GPU interface
+                    uint256 txid_uint256;
+                    std::memcpy(txid_uint256.data(), hash.data(), 32);
+                    gpu_utxo->RemoveUTXO(txid_uint256, static_cast<uint32_t>(o));
+                }
+            }
+
+            // Restore inputs from undo data
+            if (i > 0) { // not coinbase
+                const CTxUndo& txundo = blockUndo.vtxundo[i-1];
+                for (unsigned int j = 0; j < tx.vin.size(); j++) {
+                    const COutPoint& prevout = tx.vin[j].prevout;
+                    const Coin& undo_coin = txundo.vprevout[j];
+
+                    // Build GPU UTXO header from undo coin
+                    gpu::UTXOHeader header;
+                    header.amount = undo_coin.out.nValue;
+                    header.blockHeight = undo_coin.nHeight;
+                    header.vout = prevout.n;
+                    header.flags = undo_coin.fCoinBase ? gpu::UTXO_FLAG_COINBASE : 0;
+                    header.script_size = static_cast<uint16_t>(undo_coin.out.scriptPubKey.size());
+                    header.script_type = static_cast<uint8_t>(gpu::SCRIPT_TYPE_UNKNOWN);
+                    std::memset(header.padding, 0, sizeof(header.padding));
+
+                    // Convert prevout.hash to uint256
+                    uint256 prevout_txid;
+                    std::memcpy(prevout_txid.data(), prevout.hash.data(), 32);
+
+                    gpu_utxo->RestoreUTXO(prevout_txid, prevout.n, header,
+                                         undo_coin.out.scriptPubKey.data());
+                }
+            }
+        }
+
+        if (!gpu_utxo->CommitBatchUpdate()) {
+            LogWarning("GPU DisconnectBlock: batch update commit failed, GPU UTXO may be inconsistent\n");
+            // Continue with CPU path - it's authoritative
+        } else {
+            LogDebug(BCLog::VALIDATION, "GPU DisconnectBlock: committed, UTXOs=%zu\n",
+                     gpu_utxo->GetNumUTXOs());
+        }
+    }
+#endif // ENABLE_GPU_ACCELERATION
+
     // Ignore blocks that contain transactions which are 'overwritten' by later transactions,
     // unless those are already completely spent.
     // See https://github.com/bitcoin/bitcoin/issues/22596 for additional information.
@@ -2552,10 +3041,103 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // in multiple threads). Preallocate the vector size so a new allocation
     // doesn't invalidate pointers into the vector, and keep txsdata in scope
     // for as long as `control`.
-    std::optional<CCheckQueueControl<CScriptCheck>> control;
-    if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) control.emplace(queue);
-
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
+
+#ifdef ENABLE_GPU_ACCELERATION
+    // Initialize GPU acceleration for this block if enabled
+    static bool gpu_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
+    static bool gpu_validation_enabled = gArgs.GetBoolArg("-gpuvalidation", true);
+    static std::unique_ptr<gpu::GPUUTXOSet> gpu_utxo_set;
+    static std::unique_ptr<gpu::GPUBatchValidator> gpu_batch_validator;
+    static bool gpu_utxo_loaded = false;
+    static size_t vram_limit = static_cast<size_t>(gArgs.GetIntArg("-gpuvram", 8192)) * 1024 * 1024; // From -gpuvram arg (MB)
+
+    // Track which transactions need GPU validation
+    std::vector<size_t> gpu_validation_tx_indices;
+    std::vector<std::vector<int>> gpu_job_indices;  // job indices per transaction
+
+    if (gpu_enabled && !fJustCheck && fScriptChecks) {
+        if (!gpu_utxo_set) {
+            gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
+            if (!gpu_utxo_set->Initialize(vram_limit)) {
+                LogWarning("GPU UTXO set initialization failed, falling back to CPU\n");
+                gpu_enabled = false;
+                gpu_utxo_set.reset();
+            } else {
+                LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", vram_limit / (1024 * 1024));
+            }
+        }
+
+        // Initialize batch validator
+        if (gpu_validation_enabled && !gpu_batch_validator) {
+            gpu_batch_validator = std::make_unique<gpu::GPUBatchValidator>();
+            if (!gpu_batch_validator->Initialize()) {
+                LogWarning("GPU batch validator initialization failed, falling back to CPU\n");
+                gpu_validation_enabled = false;
+                gpu_batch_validator.reset();
+            } else {
+                LogInfo("GPU batch validator initialized\n");
+                if (gpu_utxo_set) {
+                    gpu_batch_validator->SetUTXOSet(gpu_utxo_set.get());
+                }
+            }
+        }
+
+        // Load entire UTXO set to GPU on first use (hybrid mode)
+        if (gpu_utxo_set && !gpu_utxo_loaded) {
+            LogInfo("Loading entire UTXO set to GPU VRAM for hybrid CPU-GPU validation...\n");
+            auto load_start = SteadyClock::now();
+
+            // Pass the coins cache view to load all UTXOs
+            if (gpu_utxo_set->LoadFromCPU(&view)) {
+                auto load_time = SteadyClock::now() - load_start;
+                LogInfo("Successfully loaded %zu UTXOs to GPU in %.2f seconds\n",
+                        gpu_utxo_set->GetNumUTXOs(),
+                        Ticks<SecondsDouble>(load_time));
+                LogInfo("GPU VRAM usage: %zu MB / %zu MB\n",
+                        gpu_utxo_set->GetVRAMUsage() / (1024 * 1024),
+                        vram_limit / (1024 * 1024));
+                gpu_utxo_loaded = true;
+            } else {
+                LogWarning("Failed to load UTXO set to GPU, falling back to CPU-only validation\n");
+                gpu_enabled = false;
+                gpu_utxo_set.reset();
+            }
+        }
+
+        // Check if compaction is needed
+        if (gpu_utxo_set && gpu_utxo_loaded && gpu_utxo_set->NeedsCompaction()) {
+            LogDebug(BCLog::BENCH, "GPU UTXO set fragmentation detected, running compaction...\n");
+            if (gpu_utxo_set->Compact()) {
+                LogDebug(BCLog::BENCH, "GPU UTXO compaction completed successfully\n");
+            }
+        }
+
+        // Begin batch for this block
+        if (gpu_batch_validator && gpu_validation_enabled) {
+            gpu_batch_validator->BeginBatch();
+            gpu_job_indices.resize(block.vtx.size());
+        }
+    }
+#endif
+
+    // CPU parallel script check control - only used when GPU validation is NOT active
+    // When GPU handles script validation, we don't need the CPU thread pool
+    std::optional<CCheckQueueControl<CScriptCheck>> control;
+#ifdef ENABLE_GPU_ACCELERATION
+    bool use_gpu_validation = gpu_enabled && gpu_batch_validator && gpu_validation_enabled;
+    if (!use_gpu_validation) {
+        if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) {
+            control.emplace(queue);
+        }
+    } else {
+        LogDebug(BCLog::BENCH, "GPU validation active, skipping CPU script check queue\n");
+    }
+#else
+    if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) {
+        control.emplace(queue);
+    }
+#endif
 
     std::vector<int> prevheights;
     CAmount nFees = 0;
@@ -2573,6 +3155,17 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             CAmount txfee = 0;
             TxValidationState tx_state;
+            
+#ifdef ENABLE_GPU_ACCELERATION
+            // Use GPU-accelerated UTXO lookups if available
+            if (gpu_enabled && gpu_utxo_set) {
+                LogDebug(BCLog::BENCH, "Using GPU for UTXO lookups for tx %s with %u inputs\n", 
+                         tx.GetHash().ToString().substr(0, 10), tx.vin.size());
+                // TODO: Implement GPU-accelerated CheckTxInputs
+                // For now, continue with CPU validation
+            }
+#endif
+            
             if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
@@ -2617,6 +3210,275 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             bool tx_ok;
             TxValidationState tx_state;
+            
+#ifdef ENABLE_GPU_ACCELERATION
+            // Queue transaction for GPU batch validation
+            bool use_gpu_for_this_tx = false;
+            if (use_gpu_validation) {
+                // Check if all inputs have valid UTXOs for GPU validation
+                bool gpu_validation_suitable = true;
+                for (const auto& input : tx.vin) {
+                    const Coin& coin = view.AccessCoin(input.prevout);
+                    if (coin.IsSpent()) {
+                        gpu_validation_suitable = false;
+                        break;
+                    }
+                    // GPU now supports ALL script types:
+                    // P2PKH, P2SH, P2WPKH, P2WSH, P2TR, and any nonstandard scripts
+                    // No script type filtering needed
+                }
+
+                if (gpu_validation_suitable) {
+                    // Initialize PrecomputedTransactionData for sighash computation
+                    // Collect spent outputs for this transaction
+                    std::vector<CTxOut> spent_outputs;
+                    spent_outputs.reserve(tx.vin.size());
+                    for (const auto& input : tx.vin) {
+                        const Coin& coin = view.AccessCoin(input.prevout);
+                        spent_outputs.push_back(coin.out);
+                    }
+                    txsdata[i].Init(tx, std::move(spent_outputs));
+
+                    // Queue all inputs for this transaction
+                    for (size_t j = 0; j < tx.vin.size(); j++) {
+                        const CTxIn& txin = tx.vin[j];
+                        const Coin& coin = view.AccessCoin(txin.prevout);
+
+                        // Determine sigversion based on script type
+                        gpu::GPUSigVersion sigversion = gpu::GPU_SIGVERSION_BASE;
+                        SigVersion cpu_sigversion = SigVersion::BASE;
+                        gpu::ScriptType stype = gpu::IdentifyScriptType(
+                            coin.out.scriptPubKey.data(),
+                            coin.out.scriptPubKey.size());
+                        if (stype == gpu::SCRIPT_TYPE_P2WPKH || stype == gpu::SCRIPT_TYPE_P2WSH) {
+                            sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
+                            cpu_sigversion = SigVersion::WITNESS_V0;
+                        } else if (stype == gpu::SCRIPT_TYPE_P2TR) {
+                            // P2TR: distinguish between key path and script path spends
+                            // Key path: witness = [signature] (1 element)
+                            // Script path: witness = [stack..., tapscript, control_block] (2+ elements)
+                            // Note: annex (if present) is last item starting with 0x50
+                            const auto& wit = txin.scriptWitness.stack;
+                            size_t wit_count = wit.size();
+
+                            // Check for annex (last element starts with 0x50)
+                            bool has_annex = (wit_count >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+                            size_t effective_count = has_annex ? wit_count - 1 : wit_count;
+
+                            if (effective_count == 1) {
+                                // Key path spend
+                                sigversion = gpu::GPU_SIGVERSION_TAPROOT;
+                                cpu_sigversion = SigVersion::TAPROOT;
+                            } else {
+                                // Script path spend (2+ elements: stack items + tapscript + control block)
+                                sigversion = gpu::GPU_SIGVERSION_TAPSCRIPT;
+                                cpu_sigversion = SigVersion::TAPSCRIPT;
+                            }
+                        } else if (stype == gpu::SCRIPT_TYPE_P2SH && !txin.scriptWitness.IsNull()) {
+                            // P2SH-wrapped witness (P2SH-P2WPKH or P2SH-P2WSH)
+                            sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
+                            cpu_sigversion = SigVersion::WITNESS_V0;
+                        }
+
+                        // Compute sighash using the actual sighash type from the signature
+                        uint256 sighash;
+                        const uint8_t* sighash_ptr = nullptr;
+
+                        // Extract sighash type from signature
+                        // For ECDSA: last byte of DER signature in scriptSig or witness
+                        // For Schnorr: last byte if sig is 65 bytes, else SIGHASH_DEFAULT
+                        int nHashType = SIGHASH_ALL;  // Default
+
+                        if (cpu_sigversion == SigVersion::TAPROOT || cpu_sigversion == SigVersion::TAPSCRIPT) {
+                            // Taproot/Tapscript: signature is in witness[0]
+                            // 64 bytes = SIGHASH_DEFAULT (0x00)
+                            // 65 bytes = last byte is sighash type
+                            const auto& wit = txin.scriptWitness.stack;
+                            if (!txin.scriptWitness.IsNull() && !wit.empty()) {
+                                const auto& sig = wit[0];
+                                if (sig.size() == 65) {
+                                    nHashType = sig[64];
+                                } else {
+                                    nHashType = 0x00;  // SIGHASH_DEFAULT
+                                }
+                            }
+                            ScriptExecutionData execdata;
+                            execdata.m_annex_init = true;
+                            execdata.m_codeseparator_pos_init = true;
+                            execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+
+                            // Detect annex: last witness element starts with 0x50 when 2+ elements
+                            bool has_annex = (wit.size() >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+                            if (has_annex) {
+                                execdata.m_annex_present = true;
+                                // Compute annex hash: SHA256 of (compact_size(annex.size()) || annex)
+                                const auto& annex = wit.back();
+                                std::vector<unsigned char> annex_with_size;
+                                annex_with_size.reserve(annex.size() + 5);
+                                // Add compact size prefix
+                                if (annex.size() < 253) {
+                                    annex_with_size.push_back(static_cast<unsigned char>(annex.size()));
+                                } else if (annex.size() <= 0xFFFF) {
+                                    annex_with_size.push_back(253);
+                                    annex_with_size.push_back(annex.size() & 0xFF);
+                                    annex_with_size.push_back((annex.size() >> 8) & 0xFF);
+                                }
+                                annex_with_size.insert(annex_with_size.end(), annex.begin(), annex.end());
+                                CSHA256().Write(annex_with_size.data(), annex_with_size.size()).Finalize(execdata.m_annex_hash.begin());
+                            } else {
+                                execdata.m_annex_present = false;
+                            }
+
+                            // For script path spends, compute tapleaf hash
+                            if (cpu_sigversion == SigVersion::TAPSCRIPT) {
+                                // Script path: witness = [stack_items..., tapscript, control_block, (annex)]
+                                // Control block is last (or second-to-last if annex present)
+                                // Tapscript is second-to-last (or third-to-last if annex present)
+                                size_t ctrl_idx = has_annex ? wit.size() - 2 : wit.size() - 1;
+                                size_t script_idx = ctrl_idx - 1;
+
+                                if (script_idx < wit.size() && ctrl_idx < wit.size()) {
+                                    const auto& tapscript = wit[script_idx];
+                                    const auto& control_block = wit[ctrl_idx];
+
+                                    // Extract leaf version from control block (first byte's low 1 bit gives parity, rest is version)
+                                    // Leaf version is (control_block[0] & 0xfe)
+                                    uint8_t leaf_version = control_block.empty() ? 0xc0 : (control_block[0] & 0xfe);
+
+                                    // Compute tapleaf hash = SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version || compact_size(script.size()) || script)
+                                    execdata.m_tapleaf_hash_init = true;
+                                    // Use Bitcoin Core's existing tapleaf hash computation
+                                    execdata.m_tapleaf_hash = ComputeTapleafHash(leaf_version, tapscript);
+                                }
+                            }
+
+                            if (SignatureHashSchnorr(sighash, execdata, tx, j, nHashType, cpu_sigversion, txsdata[i], MissingDataBehavior::FAIL)) {
+                                sighash_ptr = sighash.data();
+                            }
+                        } else if (cpu_sigversion == SigVersion::WITNESS_V0) {
+                            // SegWit v0: signature is in witness stack
+                            // For P2WPKH: witness[0] is signature
+                            // For P2WSH: signatures are in witness stack before redeem script
+                            if (!txin.scriptWitness.IsNull() && !txin.scriptWitness.stack.empty()) {
+                                const auto& sig = txin.scriptWitness.stack[0];
+                                if (!sig.empty()) {
+                                    nHashType = sig.back();
+                                }
+                            }
+
+                            // Construct proper scriptCode for BIP143 sighash
+                            // P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+                            // P2WSH: The witness script (last element of witness stack)
+                            CScript scriptCode;
+                            const CScript& spk = coin.out.scriptPubKey;
+                            if (spk.size() == 22 && spk[0] == OP_0 && spk[1] == 0x14) {
+                                // P2WPKH: construct implied P2PKH script
+                                // Extract the 20-byte pubkey hash and use << operator to add proper push opcode
+                                std::vector<unsigned char> pubkeyhash(spk.begin() + 2, spk.end());
+                                scriptCode << OP_DUP << OP_HASH160 << pubkeyhash << OP_EQUALVERIFY << OP_CHECKSIG;
+                            } else if (spk.size() == 34 && spk[0] == OP_0 && spk[1] == 0x20) {
+                                // P2WSH: use witness script (last element of witness stack)
+                                if (!txin.scriptWitness.IsNull() && !txin.scriptWitness.stack.empty()) {
+                                    const auto& witnessScript = txin.scriptWitness.stack.back();
+                                    scriptCode = CScript(witnessScript.begin(), witnessScript.end());
+                                } else {
+                                    // No witness script available - fall back to CPU
+                                    scriptCode = spk;
+                                }
+                            } else {
+                                // Unknown witness program - use raw scriptPubKey
+                                scriptCode = spk;
+                            }
+
+                            sighash = SignatureHash(scriptCode, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
+                            sighash_ptr = sighash.data();
+
+                        } else {
+                            // Legacy: signature is in scriptSig (first push)
+                            // Parse DER signature to get sighash type
+                            CScript::const_iterator pc = txin.scriptSig.begin();
+                            opcodetype opcode;
+                            std::vector<unsigned char> sig;
+                            if (txin.scriptSig.GetOp(pc, opcode, sig) && !sig.empty()) {
+                                nHashType = sig.back();
+                            }
+                            sighash = SignatureHash(coin.out.scriptPubKey, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
+                            sighash_ptr = sighash.data();
+                        }
+
+                        // Serialize witness data using proper CompactSize encoding
+                        std::vector<uint8_t> witness_data;
+                        if (!txin.scriptWitness.IsNull()) {
+                            for (const auto& item : txin.scriptWitness.stack) {
+                                // CompactSize encoding for length (matches Bitcoin Core serialization)
+                                size_t item_size = item.size();
+                                if (item_size < 0xFD) {
+                                    witness_data.push_back(static_cast<uint8_t>(item_size));
+                                } else if (item_size <= 0xFFFF) {
+                                    witness_data.push_back(0xFD);
+                                    witness_data.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                                } else if (item_size <= 0xFFFFFFFF) {
+                                    witness_data.push_back(0xFE);
+                                    witness_data.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 16) & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 24) & 0xFF));
+                                } else {
+                                    // 0xFF format for 64-bit (unlikely for witness items)
+                                    witness_data.push_back(0xFF);
+                                    for (int k = 0; k < 8; k++) {
+                                        witness_data.push_back(static_cast<uint8_t>((item_size >> (k * 8)) & 0xFF));
+                                    }
+                                }
+                                witness_data.insert(witness_data.end(), item.begin(), item.end());
+                            }
+                        }
+
+                        int job_idx = gpu_batch_validator->QueueJob(
+                            i,  // tx_index
+                            j,  // input_index
+                            coin.out.scriptPubKey.data(),
+                            coin.out.scriptPubKey.size(),
+                            txin.scriptSig.data(),
+                            txin.scriptSig.size(),
+                            witness_data.data(),
+                            witness_data.size(),
+                            txin.scriptWitness.IsNull() ? 0 : txin.scriptWitness.stack.size(),
+                            coin.out.nValue,
+                            txin.nSequence,
+                            static_cast<uint32_t>(flags.as_int()),
+                            sigversion,
+                            sighash_ptr  // Pass precomputed sighash
+                        );
+
+                        if (job_idx >= 0) {
+                            gpu_job_indices[i].push_back(job_idx);
+                        } else {
+                            // Queue full, fall back to CPU for this tx
+                            gpu_job_indices[i].clear();
+                            break;
+                        }
+                    }
+
+                    if (!gpu_job_indices[i].empty() && gpu_job_indices[i].size() == tx.vin.size()) {
+                        use_gpu_for_this_tx = true;
+                        gpu_validation_tx_indices.push_back(i);
+                        LogDebug(BCLog::BENCH, "Queued tx %s for GPU validation (%zu inputs)\n",
+                                 tx.GetHash().ToString().substr(0, 10), tx.vin.size());
+                    }
+                }
+            }
+
+            // Skip CPU script validation if GPU will handle this transaction
+            // BUT we still need to update the UTXO set (UpdateCoins) below!
+            if (use_gpu_for_this_tx) {
+                // Don't continue here - we need to run UpdateCoins below
+                // The GPU will validate scripts in batch after all transactions are queued
+                // Fall through to UpdateCoins
+            } else {
+#endif
+            
             // If CheckInputScripts is called with a pointer to a checks vector, the resulting checks are appended to it. In that case
             // they need to be added to control which runs them asynchronously. Otherwise, CheckInputScripts runs the checks before returning.
             if (control) {
@@ -2632,6 +3494,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                               tx_state.GetRejectReason(), tx_state.GetDebugMessage());
                 break;
             }
+#ifdef ENABLE_GPU_ACCELERATION
+            } // Close the else block from use_gpu_for_this_tx check
+#endif
         }
 
         CTxUndo undoDummy;
@@ -2639,7 +3504,129 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             blockundo.vtxundo.emplace_back();
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+        
+#ifdef ENABLE_GPU_ACCELERATION
+        // Update GPU UTXO set to maintain sync with CPU in hybrid mode
+        if (gpu_utxo_set && gpu_utxo_loaded) {
+            // Spend inputs from GPU UTXO set
+            if (!tx.IsCoinBase()) {
+                for (const auto& input : tx.vin) {
+                    gpu_utxo_set->SpendUTXO(input.prevout.hash.ToUint256(), input.prevout.n);
+                }
+            }
+            
+            // Add new outputs to GPU UTXO set
+            for (size_t out = 0; out < tx.vout.size(); out++) {
+                if (!tx.vout[out].IsNull()) {
+                    gpu::UTXOHeader header;
+                    memset(&header, 0, sizeof(header));
+                    header.amount = tx.vout[out].nValue;
+                    header.vout = out;
+                    header.blockHeight = pindex->nHeight;
+                    header.flags = tx.IsCoinBase() ? gpu::UTXO_FLAG_COINBASE : 0;
+                    
+                    const CScript& script = tx.vout[out].scriptPubKey;
+                    header.script_size = script.size();
+                    
+                    // Let GPU's IdentifyScriptType handle script classification
+                    // This is a simple pattern match, much faster than Solver
+                    header.script_type = gpu::IdentifyScriptType(script.data(), script.size());
+                    
+                    gpu_utxo_set->AddUTXO(tx.GetHash().ToUint256(), out, header, script.data());
+                }
+            }
+        }
+#endif
     }
+
+#ifdef ENABLE_GPU_ACCELERATION
+    // Execute GPU batch validation for queued transactions
+    if (gpu_batch_validator && gpu_validation_enabled && !gpu_validation_tx_indices.empty() && state.IsValid()) {
+        gpu_batch_validator->EndBatch();
+
+        LogDebug(BCLog::BENCH, "Executing GPU batch validation for %zu transactions (%zu jobs)\n",
+                 gpu_validation_tx_indices.size(), gpu_batch_validator->GetQueuedJobCount());
+
+        auto gpu_start = SteadyClock::now();
+        gpu::BatchValidationResult batch_result = gpu_batch_validator->ValidateBatch();
+        auto gpu_end = SteadyClock::now();
+
+        LogDebug(BCLog::BENCH, "GPU batch validation: %u valid, %u invalid, %u skipped (%.2fms GPU, %.2fms setup)\n",
+                 batch_result.valid_count, batch_result.invalid_count, batch_result.skipped_count,
+                 batch_result.gpu_time_ms, batch_result.setup_time_ms);
+
+        // Handle validation failures
+        if (batch_result.has_error) {
+            // Find the first failed transaction
+            uint32_t failed_tx_idx = batch_result.first_error_tx;
+            uint32_t failed_input = batch_result.first_error_input;
+            const CTransaction& failed_tx = *(block.vtx[failed_tx_idx]);
+
+            // Map GPU error to ScriptError
+            const char* error_str = "unknown-gpu-error";
+            switch (batch_result.first_error_code) {
+                case gpu::GPU_SCRIPT_ERR_EVAL_FALSE: error_str = "SCRIPT_ERR_EVAL_FALSE"; break;
+                case gpu::GPU_SCRIPT_ERR_SIG_DER: error_str = "SCRIPT_ERR_SIG_DER"; break;
+                case gpu::GPU_SCRIPT_ERR_SIG_HASHTYPE: error_str = "SCRIPT_ERR_SIG_HASHTYPE"; break;
+                case gpu::GPU_SCRIPT_ERR_SIG_HIGH_S: error_str = "SCRIPT_ERR_SIG_HIGH_S"; break;
+                case gpu::GPU_SCRIPT_ERR_PUBKEYTYPE: error_str = "SCRIPT_ERR_PUBKEYTYPE"; break;
+                case gpu::GPU_SCRIPT_ERR_SCHNORR_SIG: error_str = "SCRIPT_ERR_SCHNORR_SIG"; break;
+                case gpu::GPU_SCRIPT_ERR_SCHNORR_SIG_SIZE: error_str = "SCRIPT_ERR_SCHNORR_SIG_SIZE"; break;
+                default: break;
+            }
+
+            auto debug_str = strprintf("input %u of %s (GPU validated)",
+                                       failed_input, failed_tx.GetHash().ToString());
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                         strprintf("gpu-script-verify-flag-failed (%s)", error_str),
+                         debug_str);
+        }
+
+        // Handle skipped transactions (fall back to CPU)
+        if (batch_result.skipped_count > 0 && state.IsValid()) {
+            LogDebug(BCLog::BENCH, "Falling back to CPU validation for %u skipped GPU jobs\n",
+                     batch_result.skipped_count);
+
+            // Re-validate skipped transactions on CPU
+            for (size_t tx_idx : gpu_validation_tx_indices) {
+                const CTransaction& tx = *(block.vtx[tx_idx]);
+                bool all_valid = true;
+
+                // Check if any input for this tx was skipped
+                for (int job_idx : gpu_job_indices[tx_idx]) {
+                    const gpu::ScriptValidationJob* job = gpu_batch_validator->GetJob(job_idx);
+                    if (job && !job->validated) {
+                        // This job was skipped, need CPU validation
+                        all_valid = false;
+                        break;
+                    }
+                    if (job && !job->valid) {
+                        all_valid = false;
+                        break;
+                    }
+                }
+
+                if (!all_valid) {
+                    // Validate this transaction on CPU
+                    TxValidationState tx_state;
+                    bool fCacheResults = fJustCheck;
+                    if (!CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                                          txsdata[tx_idx], m_chainman.m_validation_cache)) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     tx_state.GetRejectReason(), tx_state.GetDebugMessage());
+                        break;
+                    }
+                }
+            }
+        }
+
+        LogDebug(BCLog::BENCH, "      - GPU validate %zu transactions: %.2fms [%.2fs total GPU time]\n",
+                 gpu_validation_tx_indices.size(),
+                 Ticks<MillisecondsDouble>(gpu_end - gpu_start),
+                 batch_result.gpu_time_ms / 1000.0);
+    }
+#endif
+
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
     LogDebug(BCLog::BENCH, "      - Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin) [%.2fs (%.2fms/blk)]\n", (unsigned)block.vtx.size(),

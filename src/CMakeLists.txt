@@ -285,6 +285,7 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:libevent::extra>
     $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
+    $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:bitcoin_kernel_gpu>
 )
 
 # Bitcoin wrapper executable that can call other executables.
@@ -403,6 +404,10 @@ if(BUILD_KERNEL_LIB)
     )
     install_binary_component(bitcoin-chainstate INTERNAL)
   endif()
+endif()
+
+if(ENABLE_GPU_ACCELERATION)
+  add_subdirectory(gpu_kernel)
 endif()
 
 

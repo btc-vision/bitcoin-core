@@ -22,6 +22,15 @@
 #include <functional>
 #include <unordered_map>
 
+// Forward declarations for GPU types
+namespace gpu {
+    struct UTXOHeader;
+    struct uint256_gpu;
+    bool LoadUTXOSetToCPU(const void*, std::vector<UTXOHeader>&, 
+                          std::vector<uint256_gpu>&, std::vector<uint8_t>&,
+                          size_t, size_t);
+}
+
 /**
  * A UTXO entry.
  *
@@ -353,6 +362,9 @@ public:
     bool BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &hashBlock) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
     size_t EstimateSize() const override;
+    
+    //! Get the base view for GPU UTXO loading
+    CCoinsView* GetBase() const { return base; }
 };
 
 
@@ -485,6 +497,12 @@ private:
      * memory usage.
      */
     CCoinsMap::iterator FetchCoin(const COutPoint &outpoint) const;
+    
+    // Friend declaration to allow GPU UTXO loader to access internal cache
+    // Forward declare the namespace and function
+    friend bool ::gpu::LoadUTXOSetToCPU(const void*, std::vector<::gpu::UTXOHeader>&, 
+                                         std::vector<::gpu::uint256_gpu>&, std::vector<uint8_t>&,
+                                         size_t, size_t);
 };
 
 //! Utility function to add all of a transaction's outputs to a cache.

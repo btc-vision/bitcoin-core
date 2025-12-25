@@ -194,6 +194,13 @@ protected:
     CAmount m_total_fee GUARDED_BY(cs){0};       //!< sum of all mempool tx's fees (NOT modified fee)
     uint64_t cachedInnerUsage GUARDED_BY(cs){0}; //!< sum of dynamic memory usage of all the map elements (NOT the maps themselves)
 
+#ifdef ENABLE_GPU_ACCELERATION
+    // GPU validation statistics for mempool acceptance
+    uint64_t m_gpu_validated_count GUARDED_BY(cs){0};  //!< Transactions validated by GPU
+    uint64_t m_gpu_eligible_count GUARDED_BY(cs){0};   //!< Transactions eligible for GPU (simple script types)
+    uint64_t m_gpu_fallback_count GUARDED_BY(cs){0};   //!< Transactions that fell back to CPU after GPU attempt
+#endif
+
     mutable int64_t lastRollingFeeUpdate GUARDED_BY(cs){GetTime()};
     mutable bool blockSinceLastRollingFeeBump GUARDED_BY(cs){false};
     mutable double rollingMinimumFeeRate GUARDED_BY(cs){0}; //!< minimum fee to get into the pool, decreases exponentially
@@ -502,6 +509,32 @@ public:
         AssertLockHeld(cs);
         return m_total_fee;
     }
+
+#ifdef ENABLE_GPU_ACCELERATION
+    /** GPU validation statistics */
+    uint64_t GetGPUValidatedCount() const EXCLUSIVE_LOCKS_REQUIRED(cs)
+    {
+        AssertLockHeld(cs);
+        return m_gpu_validated_count;
+    }
+
+    uint64_t GetGPUEligibleCount() const EXCLUSIVE_LOCKS_REQUIRED(cs)
+    {
+        AssertLockHeld(cs);
+        return m_gpu_eligible_count;
+    }
+
+    uint64_t GetGPUFallbackCount() const EXCLUSIVE_LOCKS_REQUIRED(cs)
+    {
+        AssertLockHeld(cs);
+        return m_gpu_fallback_count;
+    }
+
+    /** Increment GPU statistics (called from validation) */
+    void IncrementGPUValidated() EXCLUSIVE_LOCKS_REQUIRED(cs) { ++m_gpu_validated_count; }
+    void IncrementGPUEligible() EXCLUSIVE_LOCKS_REQUIRED(cs) { ++m_gpu_eligible_count; }
+    void IncrementGPUFallback() EXCLUSIVE_LOCKS_REQUIRED(cs) { ++m_gpu_fallback_count; }
+#endif
 
     bool exists(const Txid& txid) const
     {
