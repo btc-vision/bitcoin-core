@@ -149,6 +149,7 @@ if(ENABLE_GPU_ACCELERATION)
     gpu_sighash_tests.cpp
     gpu_tx_graph_tests.cpp
     gpu_p2tr_script_path_tests.cpp
+    gpu_tapscript_rules_tests.cpp
   )
 endif()
 

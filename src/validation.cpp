@@ -31,7 +31,6 @@
 #include <kernel/warning.h>
 #ifdef ENABLE_GPU_ACCELERATION
 #include <gpu_kernel/gpu_utxo.h>
-#include <gpu_kernel/gpu_validation.h>
 #include <gpu_kernel/gpu_batch_validator.h>
 #endif
 #include <logging.h>
@@ -653,16 +652,34 @@ static bool GPUValidateSingleTransaction(
             }
         }
 
-        // Serialize witness data for GPU
+        // Serialize witness data for GPU using proper CompactSize encoding
         std::vector<uint8_t> serialized_witness;
         uint32_t witness_count = 0;
 
         if (tx.HasWitness() && i < tx.vin.size() && !tx.vin[i].scriptWitness.IsNull()) {
             const CScriptWitness& wit = tx.vin[i].scriptWitness;
             witness_count = wit.stack.size();
-            // Serialize witness: for each item, push length byte then data
+            // Serialize witness: for each item, push CompactSize length then data
             for (const auto& item : wit.stack) {
-                serialized_witness.push_back(static_cast<uint8_t>(item.size()));
+                size_t item_size = item.size();
+                if (item_size < 0xFD) {
+                    serialized_witness.push_back(static_cast<uint8_t>(item_size));
+                } else if (item_size <= 0xFFFF) {
+                    serialized_witness.push_back(0xFD);
+                    serialized_witness.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                } else if (item_size <= 0xFFFFFFFF) {
+                    serialized_witness.push_back(0xFE);
+                    serialized_witness.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 16) & 0xFF));
+                    serialized_witness.push_back(static_cast<uint8_t>((item_size >> 24) & 0xFF));
+                } else {
+                    serialized_witness.push_back(0xFF);
+                    for (int k = 0; k < 8; k++) {
+                        serialized_witness.push_back(static_cast<uint8_t>((item_size >> (k * 8)) & 0xFF));
+                    }
+                }
                 serialized_witness.insert(serialized_witness.end(), item.begin(), item.end());
             }
         }
@@ -717,7 +734,30 @@ static bool GPUValidateSingleTransaction(
             if (witness_count > 0 && !tx.vin[i].scriptWitness.stack.empty() && !tx.vin[i].scriptWitness.stack[0].empty()) {
                 nHashType = tx.vin[i].scriptWitness.stack[0].back();
             }
-            sighash = SignatureHash(scriptPubKey, tx, i, nHashType, spent_output.nValue, SigVersion::WITNESS_V0, &txdata);
+
+            // Construct proper scriptCode for BIP143 sighash
+            // P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+            // P2WSH: The witness script (last element of witness stack)
+            CScript scriptCode;
+            if (scriptPubKey.size() == 22 && scriptPubKey[0] == OP_0 && scriptPubKey[1] == 0x14) {
+                // P2WPKH: construct implied P2PKH script
+                // Extract the 20-byte pubkey hash and use << operator to add proper push opcode
+                std::vector<unsigned char> pubkeyhash(scriptPubKey.begin() + 2, scriptPubKey.end());
+                scriptCode << OP_DUP << OP_HASH160 << pubkeyhash << OP_EQUALVERIFY << OP_CHECKSIG;
+            } else if (scriptPubKey.size() == 34 && scriptPubKey[0] == OP_0 && scriptPubKey[1] == 0x20) {
+                // P2WSH: use witness script (last element of witness stack)
+                const auto& wit = tx.vin[i].scriptWitness.stack;
+                if (!wit.empty()) {
+                    const auto& witnessScript = wit.back();
+                    scriptCode = CScript(witnessScript.begin(), witnessScript.end());
+                } else {
+                    scriptCode = scriptPubKey;
+                }
+            } else {
+                scriptCode = scriptPubKey;
+            }
+
+            sighash = SignatureHash(scriptCode, tx, i, nHashType, spent_output.nValue, SigVersion::WITNESS_V0, &txdata);
             sighash_ptr = sighash.data();
         } else {
             // Legacy
@@ -3010,7 +3050,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     static std::unique_ptr<gpu::GPUUTXOSet> gpu_utxo_set;
     static std::unique_ptr<gpu::GPUBatchValidator> gpu_batch_validator;
     static bool gpu_utxo_loaded = false;
-    static size_t vram_limit = 8ULL * 1024 * 1024 * 1024; // 8GB VRAM limit
+    static size_t vram_limit = static_cast<size_t>(gArgs.GetIntArg("-gpuvram", 8192)) * 1024 * 1024; // From -gpuvram arg (MB)
 
     // Track which transactions need GPU validation
     std::vector<size_t> gpu_validation_tx_indices;
@@ -3325,8 +3365,34 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                     nHashType = sig.back();
                                 }
                             }
-                            sighash = SignatureHash(coin.out.scriptPubKey, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
+
+                            // Construct proper scriptCode for BIP143 sighash
+                            // P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+                            // P2WSH: The witness script (last element of witness stack)
+                            CScript scriptCode;
+                            const CScript& spk = coin.out.scriptPubKey;
+                            if (spk.size() == 22 && spk[0] == OP_0 && spk[1] == 0x14) {
+                                // P2WPKH: construct implied P2PKH script
+                                // Extract the 20-byte pubkey hash and use << operator to add proper push opcode
+                                std::vector<unsigned char> pubkeyhash(spk.begin() + 2, spk.end());
+                                scriptCode << OP_DUP << OP_HASH160 << pubkeyhash << OP_EQUALVERIFY << OP_CHECKSIG;
+                            } else if (spk.size() == 34 && spk[0] == OP_0 && spk[1] == 0x20) {
+                                // P2WSH: use witness script (last element of witness stack)
+                                if (!txin.scriptWitness.IsNull() && !txin.scriptWitness.stack.empty()) {
+                                    const auto& witnessScript = txin.scriptWitness.stack.back();
+                                    scriptCode = CScript(witnessScript.begin(), witnessScript.end());
+                                } else {
+                                    // No witness script available - fall back to CPU
+                                    scriptCode = spk;
+                                }
+                            } else {
+                                // Unknown witness program - use raw scriptPubKey
+                                scriptCode = spk;
+                            }
+
+                            sighash = SignatureHash(scriptCode, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
                             sighash_ptr = sighash.data();
+
                         } else {
                             // Legacy: signature is in scriptSig (first push)
                             // Parse DER signature to get sighash type
@@ -3340,22 +3406,32 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                             sighash_ptr = sighash.data();
                         }
 
-                        // Serialize witness data
+                        // Serialize witness data using proper CompactSize encoding
                         std::vector<uint8_t> witness_data;
                         if (!txin.scriptWitness.IsNull()) {
                             for (const auto& item : txin.scriptWitness.stack) {
-                                // Simple format: length prefix + data
-                                witness_data.push_back(static_cast<uint8_t>(item.size()));
+                                // CompactSize encoding for length (matches Bitcoin Core serialization)
+                                size_t item_size = item.size();
+                                if (item_size < 0xFD) {
+                                    witness_data.push_back(static_cast<uint8_t>(item_size));
+                                } else if (item_size <= 0xFFFF) {
+                                    witness_data.push_back(0xFD);
+                                    witness_data.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                                } else if (item_size <= 0xFFFFFFFF) {
+                                    witness_data.push_back(0xFE);
+                                    witness_data.push_back(static_cast<uint8_t>(item_size & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 8) & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 16) & 0xFF));
+                                    witness_data.push_back(static_cast<uint8_t>((item_size >> 24) & 0xFF));
+                                } else {
+                                    // 0xFF format for 64-bit (unlikely for witness items)
+                                    witness_data.push_back(0xFF);
+                                    for (int k = 0; k < 8; k++) {
+                                        witness_data.push_back(static_cast<uint8_t>((item_size >> (k * 8)) & 0xFF));
+                                    }
+                                }
                                 witness_data.insert(witness_data.end(), item.begin(), item.end());
-                            }
-                        }
-
-                        // Debug: log witness data info for P2TR
-                        if (sigversion == gpu::GPU_SIGVERSION_TAPROOT) {
-                            fprintf(stderr, "[GPU DBG] P2TR tx=%d input=%d: witness_null=%d, stack_size=%zu, serialized_size=%zu\n",
-                                    i, j, txin.scriptWitness.IsNull(), txin.scriptWitness.stack.size(), witness_data.size());
-                            if (!txin.scriptWitness.stack.empty()) {
-                                fprintf(stderr, "[GPU DBG] P2TR first witness item size=%zu\n", txin.scriptWitness.stack[0].size());
                             }
                         }
 

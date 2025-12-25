@@ -21,15 +21,7 @@
 #include <vector>
 #include <unordered_set>
 
-// Forward declaration of the GPU loader function
-namespace gpu {
-    bool LoadUTXOSetToCPU(const void* coinsCache, 
-                          std::vector<UTXOHeader>& headers,
-                          std::vector<uint256_gpu>& uniqueTxids,
-                          std::vector<uint8_t>& scriptBlob,
-                          size_t maxUTXOs,
-                          size_t maxScriptBlobSize);
-}
+// LoadUTXOSetToCPU is declared as friend in coins.h
 
 BOOST_FIXTURE_TEST_SUITE(gpu_utxo_loader_tests, TestingSetup)
 
@@ -44,11 +36,6 @@ static std::unique_ptr<CCoinsViewDB> CreateTestCoinsViewDB() {
     CoinsViewOptions options;
     // Use default options
     return std::make_unique<CCoinsViewDB>(db_params, options);
-}
-
-// Helper function to create a dummy transaction output
-static CTxOut CreateDummyOutput(CAmount value, const CScript& script) {
-    return CTxOut(value, script);
 }
 
 // Helper function to create a random outpoint

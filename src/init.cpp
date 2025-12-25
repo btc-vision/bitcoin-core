@@ -10,7 +10,6 @@
 #include <kernel/checks.h>
 #ifdef ENABLE_GPU_ACCELERATION
 #include <gpu_kernel/gpu_utxo.h>
-#include <gpu_kernel/gpu_validation.h>
 #endif
 
 #include <addrman.h>

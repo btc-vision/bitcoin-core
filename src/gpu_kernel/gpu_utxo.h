@@ -168,9 +168,9 @@ public:
     uint32_t Hash4(const uint256& txid, uint32_t vout) const;
     
     // 4-way Cuckoo hash tables
-    // Reduced from 26M to 10M entries per table to save VRAM
-    // 10M * 4 tables * 4 bytes = 160MB (vs 400MB before)
-    static constexpr size_t TABLE_SIZE = 10000000;  // 10M entries per table
+    // Reduced to give priority to GPU script interpreter
+    // 5M * 4 tables * 4 bytes = 80MB
+    static constexpr size_t TABLE_SIZE = 5000000;  // 5M entries per table
 
 private:
     // Device memory pointers

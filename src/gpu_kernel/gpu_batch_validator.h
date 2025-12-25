@@ -26,38 +26,38 @@ namespace gpu {
 // Script Validation Job - represents a single input to validate
 // ============================================================================
 
-struct ScriptValidationJob {
-    // Transaction identification
-    uint32_t tx_index;        // Index in block
-    uint32_t input_index;     // Input index within transaction
+// Ensure proper alignment for GPU memory access
+struct alignas(8) ScriptValidationJob {
+    // 8-byte aligned fields first
+    int64_t amount;                 // Amount being spent (satoshis) - 8 bytes
 
-    // Script data pointers (into GPU memory)
+    // 32-byte aligned sighash
+    uint256_gpu sighash;            // Precomputed sighash (when available) - 32 bytes
+
+    // 4-byte aligned fields
+    uint32_t tx_index;              // Index in block
+    uint32_t input_index;           // Input index within transaction
     uint32_t scriptpubkey_offset;   // Offset in scriptPubKey blob
-    uint16_t scriptpubkey_size;     // Size of scriptPubKey
     uint32_t scriptsig_offset;      // Offset in scriptSig blob
-    uint16_t scriptsig_size;        // Size of scriptSig
-
-    // Witness data
     uint32_t witness_offset;        // Offset in witness blob
-    uint16_t witness_count;         // Number of witness stack items
-    uint16_t witness_total_size;    // Total witness data size
-
-    // Transaction context
-    int64_t amount;                 // Amount being spent (satoshis)
     uint32_t sequence;              // Input sequence number
-
-    // Precomputed sighash components
-    uint256_gpu sighash;            // Precomputed sighash (when available)
-    bool sighash_valid;             // Whether sighash is precomputed
-
-    // Validation flags and context
     uint32_t verify_flags;          // SCRIPT_VERIFY_* flags
-    GPUSigVersion sigversion;       // Signature version
 
-    // Result
+    // 2-byte aligned fields (grouped together)
+    uint16_t scriptpubkey_size;     // Size of scriptPubKey
+    uint16_t scriptsig_size;        // Size of scriptSig
+    uint16_t witness_count;         // Number of witness stack items
+    uint32_t witness_total_size;    // Total witness data size (needs 32 bits for large tapscripts)
+
+    // Enums (typically 4 bytes each)
+    GPUSigVersion sigversion;       // Signature version
     GPUScriptError error;           // Error code if validation failed
+
+    // 1-byte fields (grouped at end)
+    bool sighash_valid;             // Whether sighash is precomputed
     bool validated;                 // Whether validation was attempted
     bool valid;                     // Whether validation passed
+    uint8_t padding[1];             // Explicit padding for alignment
 };
 
 // ============================================================================
@@ -90,12 +90,12 @@ class GPUBatchValidator {
 public:
     // Configuration
     // NOTE: GPUScriptContext is ~1.05MB each (2x stack of 1000 * 524 bytes)
-    // With typical 1-2GB available for batch validator after UTXO set allocation,
+    // With typical 2-8GB available for batch validator after UTXO set allocation,
     // we dynamically calculate max_jobs based on available memory.
-    // 1000 jobs = ~1.05GB which fits in typical remaining VRAM.
-    // Blocks have ~2000-4000 inputs, so we may need multiple batches for large blocks.
-    static constexpr size_t DEFAULT_MAX_JOBS = 1000;
-    static constexpr size_t MIN_MAX_JOBS = 100;  // Minimum useful batch size
+    // 2000 jobs = ~2.1GB which is the default target.
+    // Blocks have ~2000-4000 inputs, so larger batches reduce kernel launches.
+    static constexpr size_t DEFAULT_MAX_JOBS = 2000;   // ~2.1GB VRAM for contexts
+    static constexpr size_t MIN_MAX_JOBS = 100;        // Minimum useful batch size
     static constexpr size_t CONTEXT_SIZE_BYTES = 1100000;  // ~1.05MB per GPUScriptContext
     static constexpr size_t DEFAULT_SCRIPT_BLOB_SIZE = 16 * 1024 * 1024;  // 16MB
     static constexpr size_t DEFAULT_WITNESS_BLOB_SIZE = 32 * 1024 * 1024; // 32MB
@@ -228,33 +228,6 @@ __global__ void BatchValidateScriptsKernel(
     const uint8_t* witness_blob,
     GPUScriptContext* contexts,
     uint32_t job_count
-);
-
-// Parallel sighash computation kernel
-__global__ void BatchComputeSigHashKernel(
-    ScriptValidationJob* jobs,
-    const uint8_t* tx_data,
-    uint32_t job_count
-);
-
-// Parallel signature verification kernel (ECDSA)
-__global__ void BatchVerifyECDSAKernel(
-    const uint8_t* sighashes,
-    const uint8_t* signatures,
-    const uint32_t* sig_sizes,
-    const uint8_t* pubkeys,
-    const uint32_t* pubkey_sizes,
-    bool* results,
-    uint32_t count
-);
-
-// Parallel signature verification kernel (Schnorr/Taproot)
-__global__ void BatchVerifySchnorrKernel(
-    const uint8_t* sighashes,
-    const uint8_t* signatures,
-    const uint8_t* pubkeys,
-    bool* results,
-    uint32_t count
 );
 
 } // namespace gpu

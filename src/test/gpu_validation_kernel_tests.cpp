@@ -4,7 +4,6 @@
 #include <boost/test/unit_test.hpp>
 #include <test/util/setup_common.h>
 #include <gpu_kernel/gpu_utxo.h>
-#include <gpu_kernel/gpu_validation.h>
 #include <key.h>
 #include <pubkey.h>
 #include <script/script.h>

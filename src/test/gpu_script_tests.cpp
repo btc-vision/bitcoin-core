@@ -34,47 +34,6 @@ BOOST_FIXTURE_TEST_SUITE(gpu_script_tests, BasicTestingSetup)
 
 #ifdef ENABLE_GPU_ACCELERATION
 
-// Helper to run a script on GPU and compare with CPU result
-static bool RunScriptComparison(
-    const CScript& scriptPubKey,
-    const CScript& scriptSig,
-    const CScriptWitness& witness,
-    script_verify_flags flags,
-    ScriptError* cpu_error,
-    gpu::GPUScriptError* gpu_error)
-{
-    // Create a dummy transaction for testing
-    CMutableTransaction tx;
-    tx.vin.resize(1);
-    tx.vin[0].scriptSig = scriptSig;
-    tx.vin[0].scriptWitness = witness;
-    tx.vout.resize(1);
-    tx.vout[0].nValue = 0;
-
-    // CPU execution
-    ScriptError serror = SCRIPT_ERR_UNKNOWN_ERROR;
-    bool cpu_result = VerifyScript(scriptSig, scriptPubKey, &witness, flags,
-                                    MutableTransactionSignatureChecker(&tx, 0, 0, MissingDataBehavior::ASSERT_FAIL),
-                                    &serror);
-    if (cpu_error) *cpu_error = serror;
-
-    // GPU execution
-    gpu::GPUScriptContext ctx{};  // Value-initialize instead of memset
-    ctx.verify_flags = flags.as_int();
-    ctx.sigversion = gpu::GPU_SIGVERSION_BASE;
-
-    // Prepare script data
-    std::vector<uint8_t> combined_script;
-    combined_script.insert(combined_script.end(), scriptSig.begin(), scriptSig.end());
-
-    // Run GPU interpreter
-    bool gpu_result = gpu::EvalScript(&ctx, combined_script.data(), combined_script.size());
-
-    if (gpu_error) *gpu_error = ctx.error;
-
-    return cpu_result == gpu_result;
-}
-
 // =============================================================================
 // Push Data Tests
 // =============================================================================

@@ -44,11 +44,11 @@ static inline ssize_t cuFileRead(CUfileHandle_t fh, void* buf, size_t size, off_
 static inline ssize_t cuFileWrite(CUfileHandle_t fh, const void* buf, size_t size, off_t file_offset, off_t buf_offset) { return -1; }
 static inline const char* cufileop_status_error(CUfileOpError err) { return "cuFile not available"; }
 
-// Async API stubs
-static inline CUfileError_t cuFileReadAsync(CUfileHandle_t fh, void* buf, size_t* size_p, off_t* file_offset_p, off_t* buf_offset_p, ssize_t* bytes_read_p, CUstream stream) { CUfileError_t e = {CU_FILE_DRIVER_NOT_INITIALIZED, 0}; return e; }
-static inline CUfileError_t cuFileWriteAsync(CUfileHandle_t fh, void* buf, size_t* size_p, off_t* file_offset_p, off_t* buf_offset_p, ssize_t* bytes_written_p, CUstream stream) { CUfileError_t e = {CU_FILE_DRIVER_NOT_INITIALIZED, 0}; return e; }
-static inline CUfileError_t cuFileStreamRegister(CUstream stream, unsigned int flags) { CUfileError_t e = {CU_FILE_DRIVER_NOT_INITIALIZED, 0}; return e; }
-static inline CUfileError_t cuFileStreamDeregister(CUstream stream) { CUfileError_t e = {CU_FILE_SUCCESS, 0}; return e; }
+// Async API stubs (unused but required for API compatibility)
+[[maybe_unused]] static inline CUfileError_t cuFileReadAsync(CUfileHandle_t fh, void* buf, size_t* size_p, off_t* file_offset_p, off_t* buf_offset_p, ssize_t* bytes_read_p, CUstream stream) { (void)fh; (void)buf; (void)size_p; (void)file_offset_p; (void)buf_offset_p; (void)bytes_read_p; (void)stream; CUfileError_t e = {CU_FILE_DRIVER_NOT_INITIALIZED, 0}; return e; }
+[[maybe_unused]] static inline CUfileError_t cuFileWriteAsync(CUfileHandle_t fh, void* buf, size_t* size_p, off_t* file_offset_p, off_t* buf_offset_p, ssize_t* bytes_written_p, CUstream stream) { (void)fh; (void)buf; (void)size_p; (void)file_offset_p; (void)buf_offset_p; (void)bytes_written_p; (void)stream; CUfileError_t e = {CU_FILE_DRIVER_NOT_INITIALIZED, 0}; return e; }
+[[maybe_unused]] static inline CUfileError_t cuFileStreamRegister(CUstream stream, unsigned int flags) { (void)stream; (void)flags; CUfileError_t e = {CU_FILE_DRIVER_NOT_INITIALIZED, 0}; return e; }
+[[maybe_unused]] static inline CUfileError_t cuFileStreamDeregister(CUstream stream) { (void)stream; CUfileError_t e = {CU_FILE_SUCCESS, 0}; return e; }
 #endif
 
 #include <fcntl.h>

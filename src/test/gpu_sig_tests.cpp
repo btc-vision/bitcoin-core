@@ -599,17 +599,39 @@ BOOST_AUTO_TEST_CASE(bip342_signature_with_sighash_byte)
 
 BOOST_AUTO_TEST_CASE(bip342_empty_signature_invalid)
 {
-    // Empty signature must fail
+    // Empty signature must fail - BIP342 requires exactly 64 or 65 bytes
+    // Test via GPU batch validator
+    ::gpu::GPUBatchValidator validator;
+    BOOST_REQUIRE(validator.Initialize(100));
+    validator.BeginBatch();
+
+    // P2TR scriptPubKey: OP_1 <32-byte x-only pubkey>
+    uint8_t scriptpubkey[34] = {0x51, 0x20};
     CKey key;
     key.MakeNewKey(true);
     XOnlyPubKey xonly(key.GetPubKey());
+    memcpy(scriptpubkey + 2, xonly.data(), 32);
 
-    uint256 msg = GetRandHash();
-    std::vector<unsigned char> empty_sig;
+    // Witness with empty signature (0 bytes)
+    uint8_t witness[1] = {0x00};  // CompactSize 0 = empty element
 
-    // Empty sig should fail (size != 64)
-    BOOST_CHECK_EQUAL(empty_sig.size(), 0u);
-    // Note: VerifySchnorr expects exactly 64 bytes, so empty fails
+    int job = validator.QueueJob(
+        0, 0,
+        scriptpubkey, 34,
+        nullptr, 0,
+        witness, 1, 1,  // 1 byte witness data, 1 element
+        10000, 0xffffffff,
+        0, ::gpu::GPU_SIGVERSION_TAPROOT
+    );
+    BOOST_CHECK(job >= 0);
+
+    validator.EndBatch();
+    ::gpu::BatchValidationResult result = validator.ValidateBatch();
+
+    // Empty signature should fail with SCHNORR_SIG_SIZE error
+    BOOST_CHECK_EQUAL(result.valid_count, 0u);
+    BOOST_CHECK(result.has_error);
+    BOOST_CHECK_EQUAL(result.first_error_code, ::gpu::GPU_SCRIPT_ERR_SCHNORR_SIG_SIZE);
 }
 
 BOOST_AUTO_TEST_CASE(bip342_keypair_signing)

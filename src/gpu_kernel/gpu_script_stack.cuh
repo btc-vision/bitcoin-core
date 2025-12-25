@@ -72,11 +72,15 @@ __host__ __device__ inline const GPUStackElement& altstacktop(const GPUScriptCon
 // ============================================================================
 
 // Push data onto stack
+// 520-byte limit applies to ALL sigversions for stack elements
+// (The tapscript itself is handled separately via tapscript_buffer)
 __host__ __device__ inline bool stack_push(GPUScriptContext* ctx, const uint8_t* data, uint16_t size)
 {
     if (ctx->stack_size >= MAX_STACK_SIZE) {
         return ctx->set_error(GPU_SCRIPT_ERR_STACK_SIZE);
     }
+
+    // 520-byte limit for stack elements (applies to all sigversions)
     if (size > MAX_STACK_ELEMENT_SIZE) {
         return ctx->set_error(GPU_SCRIPT_ERR_PUSH_SIZE);
     }

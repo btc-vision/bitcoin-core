@@ -15,9 +15,18 @@
 #include <cstdio>
 
 // Simple logging macros for CUDA code
-#define GPU_LOG_ERROR(fmt, ...) fprintf(stderr, "[GPU ERROR] " fmt "\n", ##__VA_ARGS__)
-#define GPU_LOG_WARNING(fmt, ...) fprintf(stderr, "[GPU WARN] " fmt "\n", ##__VA_ARGS__)
-#define GPU_LOG_INFO(fmt, ...) fprintf(stdout, "[GPU INFO] " fmt "\n", ##__VA_ARGS__)
+// Set GPU_LOG_TIMING=1 to enable timing output
+#ifndef GPU_LOG_TIMING
+#define GPU_LOG_TIMING 0
+#endif
+
+#define GPU_LOG_ERROR(fmt, ...) do {} while(0)
+#define GPU_LOG_WARNING(fmt, ...) do {} while(0)
+#if GPU_LOG_TIMING
+#define GPU_LOG_INFO(fmt, ...) fprintf(stdout, "[GPU] " fmt "\n", ##__VA_ARGS__)
+#else
+#define GPU_LOG_INFO(fmt, ...) do {} while(0)
+#endif
 
 namespace gpu {
 
@@ -288,6 +297,9 @@ void GPUBatchValidator::BeginBatch()
 {
     if (!m_initialized) return;
 
+    // Clear any pending CUDA errors from previous batch
+    cudaGetLastError();
+
     m_batch_active = true;
     m_job_count = 0;
     m_scriptpubkey_used = 0;
@@ -557,6 +569,9 @@ BatchValidationResult GPUBatchValidator::ValidateBatch()
                 result.valid_count++;
             } else {
                 result.invalid_count++;
+                GPU_LOG_ERROR("INVALID JOB %zu: tx=%u input=%u error=%d sigversion=%d scriptpubkey_size=%u scriptsig_size=%u witness_count=%u witness_size=%u",
+                    i, job.tx_index, job.input_index, (int)job.error, (int)job.sigversion,
+                    job.scriptpubkey_size, job.scriptsig_size, job.witness_count, job.witness_total_size);
                 if (!result.has_error) {
                     result.has_error = true;
                     result.first_error_tx = job.tx_index;
@@ -566,6 +581,8 @@ BatchValidationResult GPUBatchValidator::ValidateBatch()
             }
         } else {
             result.skipped_count++;
+            GPU_LOG_ERROR("SKIPPED JOB %zu: tx=%u input=%u error=%d sigversion=%d",
+                i, job.tx_index, job.input_index, (int)job.error, (int)job.sigversion);
         }
     }
 
@@ -609,20 +626,32 @@ __device__ inline bool ParseWitnessStack(
     if (!witness_data || witness_size == 0 || witness_count == 0) return true;
 
     const uint8_t* ptr = witness_data;
-    uint32_t remaining = witness_size;
+    const uint8_t* end = witness_data + witness_size;
 
-    for (uint32_t i = 0; i < witness_count && remaining > 0; i++) {
-        // Read item length (simplified: 1 byte length for items < 253 bytes)
-        uint32_t item_len = ptr[0];
-        ptr++; remaining--;
+    for (uint32_t i = 0; i < witness_count && ptr < end; i++) {
+        // Parse CompactSize length
+        uint32_t item_len = 0;
+        if (ptr[0] < 0xFD) {
+            item_len = ptr[0];
+            ptr += 1;
+        } else if (ptr[0] == 0xFD && ptr + 3 <= end) {
+            item_len = ptr[1] | (static_cast<uint32_t>(ptr[2]) << 8);
+            ptr += 3;
+        } else if (ptr[0] == 0xFE && ptr + 5 <= end) {
+            item_len = ptr[1] | (static_cast<uint32_t>(ptr[2]) << 8) |
+                       (static_cast<uint32_t>(ptr[3]) << 16) |
+                       (static_cast<uint32_t>(ptr[4]) << 24);
+            ptr += 5;
+        } else {
+            return false;  // Invalid CompactSize or 0xFF format
+        }
 
-        if (item_len > remaining) return false;
+        if (ptr + item_len > end) return false;
 
         // Push to stack
         if (!stack_push(ctx, ptr, item_len)) return false;
 
         ptr += item_len;
-        remaining -= item_len;
     }
 
     return true;
@@ -745,7 +774,56 @@ __device__ inline bool ValidateSimpleScript(
         {
             // P2TR key-path: witness = [signature] (64 or 65 bytes)
             // P2TR script-path: witness = [..., script, control_block]
-            if (job.witness_count == 1) {
+            //
+            // IMPORTANT: Must detect and remove annex before deciding key-path vs script-path
+            // Annex is last witness item starting with 0x50 when 2+ items present
+
+            // Compute effective witness count (excluding annex if present)
+            uint32_t effective_witness_count = job.witness_count;
+
+            if (job.witness_count >= 2 && job.witness_total_size > 0) {
+                // Check if last witness item starts with 0x50 (annex tag)
+                const uint8_t* wptr = witness;
+                const uint8_t* wend = witness + job.witness_total_size;
+                const uint8_t* last_item = nullptr;
+                uint32_t last_item_len = 0;
+
+                for (uint32_t i = 0; i < job.witness_count; i++) {
+                    if (wptr >= wend) break;
+
+                    // Parse CompactSize length
+                    uint32_t item_len = 0;
+                    if (wptr[0] < 0xFD) {
+                        item_len = wptr[0];
+                        wptr += 1;
+                    } else if (wptr[0] == 0xFD && wptr + 3 <= wend) {
+                        item_len = wptr[1] | (static_cast<uint32_t>(wptr[2]) << 8);
+                        wptr += 3;
+                    } else if (wptr[0] == 0xFE && wptr + 5 <= wend) {
+                        item_len = wptr[1] | (static_cast<uint32_t>(wptr[2]) << 8) |
+                                   (static_cast<uint32_t>(wptr[3]) << 16) |
+                                   (static_cast<uint32_t>(wptr[4]) << 24);
+                        wptr += 5;
+                    } else {
+                        break;  // Invalid CompactSize
+                    }
+
+                    if (wptr + item_len > wend) break;
+
+                    if (i == job.witness_count - 1) {
+                        last_item = wptr;
+                        last_item_len = item_len;
+                    }
+                    wptr += item_len;
+                }
+
+                if (last_item && last_item_len > 0 && last_item[0] == 0x50) {
+                    // Has annex - don't count it
+                    effective_witness_count = job.witness_count - 1;
+                }
+            }
+
+            if (effective_witness_count == 1) {
                 // Key-path spend
                 // Safety check: witness_count > 0 but witness_total_size == 0 is inconsistent
                 if (job.witness_total_size == 0) {
@@ -754,7 +832,6 @@ __device__ inline bool ValidateSimpleScript(
                 }
                 uint8_t sig_len = witness[0];
                 if (sig_len != 64 && sig_len != 65) {
-                    printf("[GPU DEBUG] SCHNORR_SIG_SIZE error: expected 64 or 65, got %u\n", sig_len);
                     job.error = GPU_SCRIPT_ERR_SCHNORR_SIG_SIZE;
                     job.valid = false;
                     return true;
@@ -1379,12 +1456,18 @@ __global__ void BatchValidateScriptsKernel(
                 return;
             }
 
-            if (ctx.stack_size == 0) {
-                job.error = GPU_SCRIPT_ERR_EVAL_FALSE;
+            // BIP141: Cleanstack is implicit for witness programs
+            if (ctx.stack_size != 1) {
+                job.error = GPU_SCRIPT_ERR_CLEANSTACK;
                 job.valid = false;
                 return;
             }
             success = CastToBool(stacktop(&ctx, -1));
+            if (!success) {
+                job.error = GPU_SCRIPT_ERR_EVAL_FALSE;
+                job.valid = false;
+                return;
+            }
             break;
         }
 
@@ -1435,8 +1518,14 @@ __global__ void BatchValidateScriptsKernel(
                 }
             }
 
-            if (ctx.stack_size == 0) {
-                job.error = GPU_SCRIPT_ERR_EVAL_FALSE;
+            // BIP141: Cleanstack is implicit for witness programs
+            // Stack must have exactly one element after execution
+            if (ctx.stack_size != 1) {
+                if (ctx.stack_size == 0) {
+                    job.error = GPU_SCRIPT_ERR_EVAL_FALSE;
+                } else {
+                    job.error = GPU_SCRIPT_ERR_CLEANSTACK;
+                }
                 job.valid = false;
                 return;
             }
@@ -1447,9 +1536,56 @@ __global__ void BatchValidateScriptsKernel(
         case SCRIPT_TYPE_P2TR:
         {
             // Taproot: Check if key-path or script-path
+            // First, detect and handle annex (last witness item starting with 0x50)
+            uint32_t effective_witness_count = job.witness_count;
+            bool has_annex = false;
+
+            if (job.witness_count >= 2 && job.witness_total_size > 0) {
+                // Check if last witness item starts with 0x50 (annex tag)
+                // Parse witness to find last item using proper CompactSize decoding
+                const uint8_t* wptr = witness;
+                const uint8_t* wend = witness + job.witness_total_size;
+                const uint8_t* last_item = nullptr;
+                uint32_t last_item_len = 0;
+
+                for (uint32_t i = 0; i < job.witness_count; i++) {
+                    if (wptr >= wend) break;
+
+                    // Parse CompactSize length
+                    uint32_t item_len = 0;
+                    if (wptr[0] < 0xFD) {
+                        item_len = wptr[0];
+                        wptr += 1;
+                    } else if (wptr[0] == 0xFD && wptr + 3 <= wend) {
+                        item_len = wptr[1] | (static_cast<uint32_t>(wptr[2]) << 8);
+                        wptr += 3;
+                    } else if (wptr[0] == 0xFE && wptr + 5 <= wend) {
+                        item_len = wptr[1] | (static_cast<uint32_t>(wptr[2]) << 8) |
+                                   (static_cast<uint32_t>(wptr[3]) << 16) |
+                                   (static_cast<uint32_t>(wptr[4]) << 24);
+                        wptr += 5;
+                    } else {
+                        break;  // Invalid or 0xFF format
+                    }
+
+                    if (wptr + item_len > wend) break;
+
+                    if (i == job.witness_count - 1) {
+                        last_item = wptr;
+                        last_item_len = item_len;
+                    }
+                    wptr += item_len;
+                }
+
+                if (last_item && last_item_len > 0 && last_item[0] == 0x50) {
+                    has_annex = true;
+                    effective_witness_count = job.witness_count - 1;
+                }
+            }
+
             ctx.sigversion = GPU_SIGVERSION_TAPROOT;
 
-            if (job.witness_count == 1) {
+            if (effective_witness_count == 1) {
                 // Key-path spend: witness = [<signature>]
                 const uint8_t* wptr = witness;
                 uint32_t sig_len = wptr[0];
@@ -1500,56 +1636,154 @@ __global__ void BatchValidateScriptsKernel(
                 if (!success) {
                     job.error = GPU_SCRIPT_ERR_SCHNORR_SIG;
                 }
-            } else if (job.witness_count >= 2) {
+            } else if (effective_witness_count >= 2) {
                 // Script-path spend: witness = [<stack items>..., <script>, <control block>]
+                // (annex, if present, was already accounted for in effective_witness_count)
                 ctx.sigversion = GPU_SIGVERSION_TAPSCRIPT;
 
-                // Parse witness stack
-                if (!ParseWitnessStack(witness, job.witness_total_size, job.witness_count, &ctx)) {
-                    job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
-                    job.valid = false;
-                    return;
+                // Store annex presence in execdata (for sighash computation)
+                ctx.execdata.annex_present = has_annex;
+                ctx.execdata.annex_init = true;
+
+                // Parse witness directly to extract control_block and tapscript
+                // These can be larger than 520 bytes, so we DON'T push them to stack
+                // Only the remaining items (sigs, etc.) go on the stack
+                const uint8_t* wptr = witness;
+                uint32_t remaining = job.witness_total_size;
+
+                // Collect pointers to each witness item
+                const uint8_t* item_ptrs[1000];
+                uint32_t item_sizes[1000];
+                uint32_t item_count = 0;
+
+                for (uint32_t i = 0; i < effective_witness_count && remaining > 0; i++) {
+                    // Parse CompactSize length (must match Bitcoin Core's ReadCompactSize)
+                    uint32_t item_len = 0;
+                    uint32_t size_bytes = 0;
+
+                    if (wptr[0] < 0xFD) {
+                        // 1-byte length (values 0-252)
+                        item_len = wptr[0];
+                        size_bytes = 1;
+                    } else if (wptr[0] == 0xFD) {
+                        // 3-byte format: 0xFD + 2-byte little-endian
+                        if (remaining < 3) {
+                            job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
+                            job.valid = false;
+                            return;
+                        }
+                        item_len = wptr[1] | (static_cast<uint32_t>(wptr[2]) << 8);
+                        // Non-canonical check: value must be >= 253
+                        if (item_len < 253) {
+                            job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
+                            job.valid = false;
+                            return;
+                        }
+                        size_bytes = 3;
+                    } else if (wptr[0] == 0xFE) {
+                        // 5-byte format: 0xFE + 4-byte little-endian
+                        if (remaining < 5) {
+                            job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
+                            job.valid = false;
+                            return;
+                        }
+                        item_len = wptr[1] |
+                                   (static_cast<uint32_t>(wptr[2]) << 8) |
+                                   (static_cast<uint32_t>(wptr[3]) << 16) |
+                                   (static_cast<uint32_t>(wptr[4]) << 24);
+                        // Non-canonical check: value must be >= 0x10000
+                        if (item_len < 0x10000) {
+                            job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
+                            job.valid = false;
+                            return;
+                        }
+                        size_bytes = 5;
+                    } else {
+                        // 0xFF = 9-byte format (uint64_t), reject as too large
+                        job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
+                        job.valid = false;
+                        return;
+                    }
+
+                    wptr += size_bytes;
+                    remaining -= size_bytes;
+
+                    if (item_len > remaining) {
+                        job.error = GPU_SCRIPT_ERR_WITNESS_MALLEATED;
+                        job.valid = false;
+                        return;
+                    }
+                    item_ptrs[item_count] = wptr;
+                    item_sizes[item_count] = item_len;
+                    item_count++;
+                    wptr += item_len;
+                    remaining -= item_len;
                 }
 
-                // Pop control block (last item) and tapscript (second to last)
-                if (ctx.stack_size < 2) {
+
+                if (item_count < 2) {
                     job.error = GPU_SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH;
                     job.valid = false;
                     return;
                 }
 
-                GPUStackElement control_block, tapscript;
-                stack_pop_to(&ctx, control_block);
-                stack_pop_to(&ctx, tapscript);
+                // Last item is control_block, second to last is tapscript
+                const uint8_t* control_block_data = item_ptrs[item_count - 1];
+                uint32_t control_block_size = item_sizes[item_count - 1];
+                const uint8_t* tapscript_data = item_ptrs[item_count - 2];
+                uint32_t tapscript_size = item_sizes[item_count - 2];
+
+                // Push remaining items (stack items for script execution) - must be <= 520 bytes each
+                for (uint32_t i = 0; i < item_count - 2; i++) {
+                    if (item_sizes[i] > MAX_STACK_ELEMENT_SIZE) {
+                        job.error = GPU_SCRIPT_ERR_PUSH_SIZE;
+                        job.valid = false;
+                        return;
+                    }
+                    if (!stack_push(&ctx, item_ptrs[i], item_sizes[i])) {
+                        job.valid = false;
+                        return;
+                    }
+                }
 
                 // Validate control block minimum size (1 byte version + 32 byte internal key)
-                if (control_block.size < 33) {
+                if (control_block_size < 33) {
                     job.error = GPU_SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE;
                     job.valid = false;
                     return;
                 }
 
                 // Control block size must be 33 + 32*k for some k >= 0
-                if ((control_block.size - 33) % 32 != 0) {
+                if ((control_block_size - 33) % 32 != 0) {
                     job.error = GPU_SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE;
                     job.valid = false;
                     return;
                 }
 
                 // Check merkle path depth doesn't exceed 128
-                uint32_t path_len = (control_block.size - 33) / 32;
+                uint32_t path_len = (control_block_size - 33) / 32;
                 if (path_len > 128) {
                     job.error = GPU_SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE;
                     job.valid = false;
                     return;
                 }
 
-                // Extract and validate leaf version (must be valid tapscript version)
-                uint8_t leaf_version = control_block.data[0] & 0xFE;
-                if (leaf_version != 0xC0) {  // TAPROOT_LEAF_TAPSCRIPT = 0xC0
-                    // Unknown leaf version - we could allow it but for safety reject
-                    job.error = GPU_SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
-                    job.valid = false;
+                // Extract leaf version from control block
+                uint8_t leaf_version = control_block_data[0] & 0xFE;
+
+                // TAPROOT_LEAF_TAPSCRIPT = 0xC0 is the only currently defined leaf version
+                // Unknown leaf versions are allowed for forward compatibility (softfork-safe)
+                // unless DISCOURAGE_UPGRADABLE_TAPROOT_VERSION flag is set
+                if (leaf_version != 0xC0) {
+                    if (ctx.verify_flags & GPU_SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT) {
+                        job.error = GPU_SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
+                        job.valid = false;
+                        return;
+                    }
+                    // Unknown leaf version without DISCOURAGE flag: success
+                    // (anyone-can-spend for future softfork compatibility)
+                    job.valid = true;
+                    job.error = GPU_SCRIPT_ERR_OK;
                     return;
                 }
 
@@ -1559,36 +1793,138 @@ __global__ void BatchValidateScriptsKernel(
                 // Verify the merkle proof: control block commits to this script
                 if (!secp256k1::verify_taproot_script_path(
                         output_pubkey,
-                        control_block.data,
-                        control_block.size,
-                        tapscript.data,
-                        tapscript.size)) {
+                        control_block_data,
+                        control_block_size,
+                        tapscript_data,
+                        tapscript_size)) {
                     job.error = GPU_SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH;
                     job.valid = false;
                     return;
                 }
 
+
                 // Store tapleaf hash for sighash computation in CHECKSIG operations
                 uint8_t tapleaf_hash[32];
-                secp256k1::compute_tapleaf_hash(tapleaf_hash, leaf_version, tapscript.data, tapscript.size);
+                secp256k1::compute_tapleaf_hash(tapleaf_hash, leaf_version, tapscript_data, tapscript_size);
                 for (int i = 0; i < 32; i++) {
                     ctx.execdata.tapleaf_hash.data[i] = tapleaf_hash[i];
                 }
                 ctx.execdata.tapleaf_hash_init = true;
 
+                // =================================================================
+                // BIP342: OP_SUCCESS pre-scan (MUST be done BEFORE stack size checks)
+                // OP_SUCCESSx processing overrides everything, including size limits
+                // =================================================================
+                {
+                    uint32_t scan_pc = 0;
+                    while (scan_pc < tapscript_size) {
+                        uint8_t opcode = tapscript_data[scan_pc];
+
+                        // Check if this is an OP_SUCCESS opcode
+                        if (IsOpcodeSuccess(opcode)) {
+                            if (ctx.verify_flags & GPU_SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS) {
+                                job.error = GPU_SCRIPT_ERR_DISCOURAGE_OP_SUCCESS;
+                                job.valid = false;
+                                return;
+                            }
+                            // OP_SUCCESS: immediate success, skip all other validation
+                            job.valid = true;
+                            job.error = GPU_SCRIPT_ERR_OK;
+                            return;
+                        }
+
+                        // Skip this opcode (calculate instruction length)
+                        uint32_t instr_len = 1;  // Default: 1 byte for opcode itself
+                        if (opcode <= 0x4b) {
+                            // OP_PUSHBYTES_0 to OP_PUSHBYTES_75: push opcode bytes of data
+                            instr_len = 1 + opcode;
+                        } else if (opcode == 0x4c) {
+                            // OP_PUSHDATA1: 1 byte length prefix
+                            if (scan_pc + 1 < tapscript_size) {
+                                instr_len = 1 + 1 + tapscript_data[scan_pc + 1];
+                            } else {
+                                break;  // Truncated - will be caught by EvalScript
+                            }
+                        } else if (opcode == 0x4d) {
+                            // OP_PUSHDATA2: 2 byte length prefix (little-endian)
+                            if (scan_pc + 2 < tapscript_size) {
+                                uint32_t data_len = tapscript_data[scan_pc + 1] |
+                                                   (static_cast<uint32_t>(tapscript_data[scan_pc + 2]) << 8);
+                                instr_len = 1 + 2 + data_len;
+                            } else {
+                                break;  // Truncated
+                            }
+                        } else if (opcode == 0x4e) {
+                            // OP_PUSHDATA4: 4 byte length prefix (little-endian)
+                            if (scan_pc + 4 < tapscript_size) {
+                                uint32_t data_len = tapscript_data[scan_pc + 1] |
+                                                   (static_cast<uint32_t>(tapscript_data[scan_pc + 2]) << 8) |
+                                                   (static_cast<uint32_t>(tapscript_data[scan_pc + 3]) << 16) |
+                                                   (static_cast<uint32_t>(tapscript_data[scan_pc + 4]) << 24);
+                                instr_len = 1 + 4 + data_len;
+                            } else {
+                                break;  // Truncated
+                            }
+                        }
+                        // All other opcodes are 1 byte (already set)
+                        scan_pc += instr_len;
+                    }
+                }
+
+                // =================================================================
+                // BIP342: Initial stack size limit for Tapscript (before EvalScript)
+                // =================================================================
+                if (ctx.stack_size > MAX_STACK_SIZE) {
+                    job.error = GPU_SCRIPT_ERR_STACK_SIZE;
+                    job.valid = false;
+                    return;
+                }
+
+                // =================================================================
+                // BIP342: Stack element size check (520 bytes max, done AFTER OP_SUCCESS scan)
+                // This was already done during witness parsing, but double-check here
+                // =================================================================
+                for (uint32_t i = 0; i < ctx.stack_size; i++) {
+                    if (ctx.stack[i].size > MAX_STACK_ELEMENT_SIZE) {
+                        job.error = GPU_SCRIPT_ERR_PUSH_SIZE;
+                        job.valid = false;
+                        return;
+                    }
+                }
+
+                // =================================================================
+                // BIP342: Initialize validation weight for sigop budget
+                // validation_weight_left = witness_serialized_size + VALIDATION_WEIGHT_OFFSET
+                // VALIDATION_WEIGHT_OFFSET = 50 (gives credit for 1 free sigop)
+                // =================================================================
+                constexpr int64_t VALIDATION_WEIGHT_OFFSET = 50;
+                ctx.execdata.validation_weight_left = static_cast<int64_t>(job.witness_total_size) + VALIDATION_WEIGHT_OFFSET;
+                ctx.execdata.validation_weight_init = true;
+
                 // Execute the tapscript
-                if (!EvalScript(&ctx, tapscript.data, tapscript.size)) {
+                if (!EvalScript(&ctx, tapscript_data, tapscript_size)) {
                     job.error = ctx.error;
                     job.valid = false;
                     return;
                 }
 
-                if (ctx.stack_size == 0) {
+
+                // =================================================================
+                // BIP342: Cleanstack is IMPLICIT for witness programs
+                // Stack must have exactly 1 element after script execution
+                // =================================================================
+                if (ctx.stack_size != 1) {
+                    job.error = GPU_SCRIPT_ERR_CLEANSTACK;
+                    job.valid = false;
+                    return;
+                }
+
+                success = CastToBool(stacktop(&ctx, -1));
+                if (!success) {
                     job.error = GPU_SCRIPT_ERR_EVAL_FALSE;
                     job.valid = false;
                     return;
                 }
-                success = CastToBool(stacktop(&ctx, -1));
             } else {
                 job.error = GPU_SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY;
                 job.valid = false;
@@ -1665,104 +2001,6 @@ __global__ void BatchValidateScriptsKernel(
     if (!success && job.error == GPU_SCRIPT_ERR_OK) {
         job.error = GPU_SCRIPT_ERR_EVAL_FALSE;
     }
-}
-
-// NOTE: Sighash precomputation is currently done on CPU before queueing jobs
-// because sighash computation requires full transaction context (all inputs,
-// outputs, prevouts, amounts) which would require significant data transfer.
-//
-// For maximum GPU utilization in future, consider:
-// 1. Passing serialized transaction data to GPU
-// 2. Using this kernel to compute sighashes in parallel
-// 3. Then running BatchValidateScriptsKernel
-//
-// Current design: validation.cpp computes sighashes and passes via job.sighash
-__global__ void BatchComputeSigHashKernel(
-    ScriptValidationJob* jobs,
-    const uint8_t* tx_data,
-    uint32_t job_count)
-{
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= job_count) return;
-
-    ScriptValidationJob& job = jobs[idx];
-
-    // Skip if sighash already computed by CPU
-    if (job.sighash_valid) return;
-
-    // If tx_data is provided, compute sighash on GPU
-    // Currently tx_data is not populated, so sighash must be precomputed
-    if (tx_data == nullptr) {
-        job.sighash_valid = false;
-        return;
-    }
-
-    // Future: Parse tx_data and compute sighash using gpu_sighash.cuh
-    // For now, sighash computation is done on CPU before batch execution
-    job.sighash_valid = false;
-}
-
-__global__ void BatchVerifyECDSAKernel(
-    const uint8_t* sighashes,
-    const uint8_t* signatures,
-    const uint32_t* sig_sizes,
-    const uint8_t* pubkeys,
-    const uint32_t* pubkey_sizes,
-    bool* results,
-    uint32_t count)
-{
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    // Get pointers for this verification
-    const uint8_t* sighash = sighashes + (idx * 32);
-    uint32_t sig_offset = 0;
-    uint32_t pubkey_offset = 0;
-
-    // Calculate offsets (simplified - assumes fixed max sizes)
-    for (uint32_t i = 0; i < idx; i++) {
-        sig_offset += sig_sizes[i];
-        pubkey_offset += pubkey_sizes[i];
-    }
-
-    const uint8_t* sig = signatures + sig_offset;
-    uint32_t sig_size = sig_sizes[idx];
-    const uint8_t* pubkey = pubkeys + pubkey_offset;
-    uint32_t pubkey_size = pubkey_sizes[idx];
-
-    // Parse signature (DER format)
-    secp256k1::Scalar r, s;
-    if (!secp256k1::sig_parse_der_simple(r, s, sig, sig_size)) {
-        results[idx] = false;
-        return;
-    }
-
-    // Parse public key
-    secp256k1::AffinePoint pk;
-    if (!secp256k1::pubkey_parse(pk, pubkey, pubkey_size)) {
-        results[idx] = false;
-        return;
-    }
-
-    // Verify
-    results[idx] = secp256k1::ecdsa_verify_core(sighash, r, s, pk);
-}
-
-__global__ void BatchVerifySchnorrKernel(
-    const uint8_t* sighashes,
-    const uint8_t* signatures,
-    const uint8_t* pubkeys,
-    bool* results,
-    uint32_t count)
-{
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    const uint8_t* sighash = sighashes + (idx * 32);
-    const uint8_t* sig = signatures + (idx * 64);
-    const uint8_t* pubkey = pubkeys + (idx * 32);
-
-    results[idx] = secp256k1::schnorr_verify(sig, sighash, 32, pubkey);
 }
 
 } // namespace gpu

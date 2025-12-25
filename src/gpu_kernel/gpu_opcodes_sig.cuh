@@ -73,7 +73,6 @@ __device__ __host__ inline bool IsValidSigHashType(
     if (sigversion == GPU_SIGVERSION_TAPROOT || sigversion == GPU_SIGVERSION_TAPSCRIPT) {
         // Taproot/Tapscript: only allow specific values
         uint8_t base = sighash_type & 0x03;
-        bool anyonecanpay = (sighash_type & GPU_SIGHASH_ANYONECANPAY) != 0;
 
         // SIGHASH_DEFAULT (0x00) is only valid for Taproot key path
         if (sighash_type == GPU_SIGHASH_DEFAULT) {
@@ -83,7 +82,7 @@ __device__ __host__ inline bool IsValidSigHashType(
         // Valid base types: ALL (1), NONE (2), SINGLE (3)
         if (base < 1 || base > 3) return false;
 
-        // No other flags allowed besides ANYONECANPAY
+        // Only ANYONECANPAY (0x80) allowed besides base type (0x03 mask)
         if ((sighash_type & ~0x83) != 0) return false;
 
         return true;
@@ -450,32 +449,7 @@ __device__ inline bool op_checksig_impl(
                 return ctx->set_error(GPU_SCRIPT_ERR_SCHNORR_SIG_HASHTYPE);
             }
 
-            // Build sighash context using transaction data from ctx
-            sighash::GPUSigHashContext shctx;
-            shctx.tx = nullptr;  // Full tx not available in script execution
-            shctx.nIn = ctx->input_index;
-            shctx.scriptCode = nullptr;
-            shctx.scriptCodeLen = 0;
-            shctx.amount = ctx->input_amount;
-            shctx.sigversion = sighash::SigVersion::TAPSCRIPT;
-            shctx.hashesComputed = ctx->txdata.bip341_ready;
-            if (ctx->txdata.bip341_ready) {
-                for (int i = 0; i < 32; i++) {
-                    shctx.hashPrevouts[i] = ctx->txdata.prevouts_single_hash.data[i];
-                    shctx.hashSequence[i] = ctx->txdata.sequences_single_hash.data[i];
-                    shctx.hashOutputs[i] = ctx->txdata.outputs_single_hash.data[i];
-                    shctx.hashAmounts[i] = ctx->txdata.spent_amounts_single_hash.data[i];
-                    shctx.hashScriptPubKeys[i] = ctx->txdata.spent_scripts_single_hash.data[i];
-                }
-            }
-            shctx.tapleafHash = ctx->execdata.tapleaf_hash_init ?
-                                ctx->execdata.tapleaf_hash.data : nullptr;
-            shctx.keyVersion = 0;
-            shctx.codeSeparatorPos = ctx->execdata.codeseparator_pos_init ?
-                                     ctx->execdata.codeseparator_pos : 0xFFFFFFFF;
-
-            // Use precomputed sighash if available, otherwise fail
-            // (Full sighash computation requires complete tx context)
+            // Use precomputed sighash (caller must provide it)
             uint8_t sighash[32];
             if (ctx->precomputed_sighash_valid) {
                 for (int i = 0; i < 32; i++) {
@@ -483,7 +457,6 @@ __device__ inline bool op_checksig_impl(
                 }
             } else {
                 // Cannot compute sighash without full tx context
-                // This should be precomputed by the caller
                 return ctx->set_error(GPU_SCRIPT_ERR_UNKNOWN_ERROR);
             }
 

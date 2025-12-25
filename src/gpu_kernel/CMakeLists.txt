@@ -23,10 +23,6 @@ if(ENABLE_GPU_ACCELERATION)
     gpu_direct_storage.h
     gpu_direct_storage.cu
 
-    # Script validation
-    gpu_validation.cu
-    gpu_validation.h
-
     # Script execution (Phase 1+)
     gpu_script_types.cuh
     gpu_script_stack.cuh

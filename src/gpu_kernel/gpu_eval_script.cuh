@@ -104,8 +104,10 @@ __device__ inline bool EvalScript(
             ctx->pc++;
         }
 
-        // Check push size limit
-        if (push_size > MAX_SCRIPT_ELEMENT_SIZE) {
+        // Check push size limit (520 bytes max for all sigversions)
+        // Note: This applies to data being pushed during script execution
+        // The tapscript itself can be larger and is handled separately
+        if (push_size > MAX_STACK_ELEMENT_SIZE) {
             return ctx->set_error(GPU_SCRIPT_ERR_PUSH_SIZE);
         }
 

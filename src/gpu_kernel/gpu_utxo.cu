@@ -172,22 +172,24 @@ bool GPUUTXOSet::Initialize(size_t maxVRAMUsage) {
     LogGPUMessage("Setting VRAM limit to: " + std::to_string(maxVRAMLimit / (1024*1024)) + " MB");
 
     // Estimate memory allocation (reduced from original aggressive defaults):
-    // - Headers: 30M * 32B = 960MB
-    // - Scripts: 1GB (most scripts are small, average ~50 bytes)
-    // - Txid table: 20M * 32B = 640MB
-    // - Hash tables: 4 * 10M * 4B = 160MB
-    // Total: ~2.8GB base, leaving headroom for batch validator
+    // Reduced allocations to give priority to GPU script interpreter
+    // GPU interpreter needs ~2.1GB for 2000 contexts
+    // - Headers: 5M * 32B = 160MB
+    // - Scripts: 256MB
+    // - Txid table: 5M * 32B = 160MB
+    // - Hash tables: 4 * 5M * 4B = 80MB
+    // Total: ~656MB for UTXO, leaving ~8GB+ for interpreter
 
-    maxUTXOs = 30000000;  // 30 million UTXOs (covers typical active set)
-    scriptBlobSize = 1ULL * 1024 * 1024 * 1024;  // 1GB for scripts
-    txidTableSize = 20000000;  // 20 million unique txids
+    maxUTXOs = 5000000;  // 5 million UTXOs (sufficient for signet/testnet)
+    scriptBlobSize = 256ULL * 1024 * 1024;  // 256MB for scripts
+    txidTableSize = 5000000;  // 5 million unique txids
     
     // Check if we have enough memory
     size_t required_mem =
-        maxUTXOs * sizeof(UTXOHeader) +          // Headers: 30M * 32B = 960MB
-        scriptBlobSize +                          // Scripts: 1GB
-        txidTableSize * sizeof(uint256_gpu) +    // Txid table: 20M * 32B = 640MB
-        4 * TABLE_SIZE * sizeof(uint32_t);       // Hash tables: 4 * 10M * 4B = 160MB
+        maxUTXOs * sizeof(UTXOHeader) +          // Headers: 5M * 32B = 160MB
+        scriptBlobSize +                          // Scripts: 256MB
+        txidTableSize * sizeof(uint256_gpu) +    // Txid table: 5M * 32B = 160MB
+        4 * TABLE_SIZE * sizeof(uint32_t);       // Hash tables: 4 * 5M * 4B = 80MB
     
     if (required_mem > maxVRAMLimit) {
         // Scale down if needed
@@ -1117,7 +1119,10 @@ bool GPUUTXOSet::FlushToDisk() {
                 file_header.num_entries = numUTXOs;
                 file_header.data_size = numUTXOs * sizeof(UTXOHeader);
                 lseek(fd, 0, SEEK_SET);
-                write(fd, &file_header, sizeof(file_header));
+                ssize_t written = write(fd, &file_header, sizeof(file_header));
+                if (written != static_cast<ssize_t>(sizeof(file_header))) {
+                    fprintf(stderr, "[GPU UTXO] Failed to update UTXO headers file header\n");
+                }
             }
             close(fd);
         }
@@ -1129,7 +1134,10 @@ bool GPUUTXOSet::FlushToDisk() {
             if (read(fd, &file_header, sizeof(file_header)) == sizeof(file_header)) {
                 file_header.data_size = scriptBlobUsed;
                 lseek(fd, 0, SEEK_SET);
-                write(fd, &file_header, sizeof(file_header));
+                ssize_t written = write(fd, &file_header, sizeof(file_header));
+                if (written != static_cast<ssize_t>(sizeof(file_header))) {
+                    fprintf(stderr, "[GPU UTXO] Failed to update UTXO scripts file header\n");
+                }
             }
             close(fd);
         }

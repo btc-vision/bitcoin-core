@@ -487,7 +487,11 @@ __device__ __host__ inline bool ComputeWitnessV0SigHash(
 // ============================================================================
 
 // Precomputed BIP341 tag hash for "TapSighash"
+#ifdef __CUDA_ARCH__
 __device__ __constant__ const uint8_t TAPSIGHASH_TAG_HASH[32] = {
+#else
+static constexpr uint8_t TAPSIGHASH_TAG_HASH[32] = {
+#endif
     0xf4, 0x0a, 0x48, 0xdf, 0x4b, 0x2a, 0x70, 0xc8,
     0xb4, 0x92, 0x4b, 0xf2, 0x65, 0x4d, 0x2e, 0x35,
     0x27, 0x32, 0x80, 0x01, 0x02, 0x8c, 0xd9, 0x35,
@@ -527,7 +531,7 @@ __device__ __host__ inline bool ComputeTaprootSigHash(
         // hashPrevouts (SHA256, not double)
         uint8_t hashPrevouts[32];
         {
-            uint8_t tmp[4096];
+            uint8_t tmp[4096] = {0};
             uint32_t tpos = 0;
             for (uint32_t i = 0; i < tx->vinCount; i++) {
                 for (int j = 0; j < 32; j++) tmp[tpos++] = tx->vin[i].prevout.txid[j];

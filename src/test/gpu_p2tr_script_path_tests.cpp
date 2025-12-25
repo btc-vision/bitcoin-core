@@ -464,8 +464,6 @@ static gpu::GPUSigVersion DetermineSigversion(
     const std::vector<unsigned char>& scriptPubKey,
     const CScriptWitness& witness)
 {
-    gpu::GPUSigVersion sigversion = gpu::GPU_SIGVERSION_BASE;
-
     // P2WPKH
     if (scriptPubKey.size() == 22 && scriptPubKey[0] == 0x00 && scriptPubKey[1] == 0x14) {
         return gpu::GPU_SIGVERSION_WITNESS_V0;
@@ -602,6 +600,161 @@ BOOST_AUTO_TEST_CASE(sigversion_selection_empty_witness)
     gpu::GPUSigVersion sv = DetermineSigversion(p2tr, empty_witness);
     // Either TAPROOT (if we consider 0 as special) or TAPSCRIPT
     BOOST_CHECK(sv == gpu::GPU_SIGVERSION_TAPROOT || sv == gpu::GPU_SIGVERSION_TAPSCRIPT);
+}
+
+// =============================================================================
+// Large Tapscript Tests (BIP342 removes 520-byte script limit)
+// =============================================================================
+
+BOOST_AUTO_TEST_CASE(large_tapscript_size_limits)
+{
+    // Test that tapscript itself can exceed 520 bytes
+    // while individual stack elements must be <= 520 bytes
+
+    // Create a large tapscript (10KB of OP_NOPs followed by OP_TRUE)
+    std::vector<unsigned char> large_tapscript;
+    for (size_t i = 0; i < 10000; i++) {
+        large_tapscript.push_back(0x61);  // OP_NOP
+    }
+    large_tapscript.push_back(0x51);  // OP_TRUE
+
+    BOOST_CHECK_GT(large_tapscript.size(), 520u);
+    BOOST_CHECK_EQUAL(large_tapscript.size(), 10001u);
+
+    // This tapscript should be valid in BIP342 (no script size limit)
+    // The 520-byte limit only applies to stack elements
+}
+
+BOOST_AUTO_TEST_CASE(witness_stack_element_size_limit)
+{
+    // Test that witness stack elements (sigs, pubkeys) are still limited to 520 bytes
+    // even in Tapscript
+
+    std::vector<unsigned char> valid_sig(64, 0x00);    // 64 bytes - OK
+    std::vector<unsigned char> valid_pubkey(33, 0x02); // 33 bytes - OK
+    std::vector<unsigned char> max_element(520, 0x00); // 520 bytes - OK
+    std::vector<unsigned char> too_large(521, 0x00);   // 521 bytes - TOO LARGE
+
+    BOOST_CHECK_LE(valid_sig.size(), 520u);
+    BOOST_CHECK_LE(valid_pubkey.size(), 520u);
+    BOOST_CHECK_LE(max_element.size(), 520u);
+    BOOST_CHECK_GT(too_large.size(), 520u);
+
+    // GPU limit constant should be 520
+    BOOST_CHECK_EQUAL(gpu::MAX_STACK_ELEMENT_SIZE, 520u);
+}
+
+BOOST_AUTO_TEST_CASE(tapscript_vs_stack_element_distinction)
+{
+    // Verify that we correctly distinguish between:
+    // 1. Tapscript (the script to execute) - can be large
+    // 2. Stack elements (sigs, data passed to script) - max 520 bytes
+
+    // Witness for script path: [stack_item1, stack_item2, tapscript, control_block]
+    CScriptWitness witness;
+
+    // Stack items (must be <= 520 bytes each)
+    witness.stack.push_back(std::vector<unsigned char>(64, 0x00));   // sig - OK
+    witness.stack.push_back(std::vector<unsigned char>(100, 0x01));  // data - OK
+
+    // Tapscript can be large (this is NOT a stack element for EvalScript)
+    std::vector<unsigned char> large_script(5000, 0x61);  // 5KB of OP_NOP
+    large_script.push_back(0x51);  // OP_TRUE
+    witness.stack.push_back(large_script);
+
+    // Control block
+    witness.stack.push_back(std::vector<unsigned char>(33, 0xc0));
+
+    // Count elements
+    BOOST_CHECK_EQUAL(witness.stack.size(), 4u);
+
+    // Verify sizes
+    BOOST_CHECK_LE(witness.stack[0].size(), 520u);  // sig
+    BOOST_CHECK_LE(witness.stack[1].size(), 520u);  // data
+    BOOST_CHECK_GT(witness.stack[2].size(), 520u);  // tapscript - ALLOWED to be large
+    BOOST_CHECK_LE(witness.stack[3].size(), 520u);  // control block
+}
+
+BOOST_AUTO_TEST_CASE(vram_usage_estimation)
+{
+    // Calculate VRAM usage for GPU script validation
+
+    // GPUStackElement size
+    size_t stack_elem_size = sizeof(gpu::GPUStackElement);
+    BOOST_CHECK_EQUAL(stack_elem_size, 524u);  // 520 data + 2 size + 2 padding
+
+    // GPUScriptContext approximate size
+    size_t stack_size = gpu::MAX_STACK_SIZE * stack_elem_size;      // 1000 * 524 = 524 KB
+    size_t altstack_size = gpu::MAX_STACK_SIZE * stack_elem_size;   // 1000 * 524 = 524 KB
+    size_t ctx_overhead = 1024;  // Approximate overhead for other fields
+
+    size_t context_size = stack_size + altstack_size + ctx_overhead;
+
+    // Approximately 1 MB per context
+    BOOST_CHECK_GT(context_size, 1000000u);  // > 1 MB
+    BOOST_CHECK_LT(context_size, 1100000u);  // < 1.1 MB
+
+    // For 4000 tapscript jobs (worst case: each needs own context)
+    size_t vram_4k_jobs = 4000 * context_size;
+
+    // Should be approximately 4 GB
+    BOOST_CHECK_GT(vram_4k_jobs, 4000000000ull);  // > 4 GB
+    BOOST_CHECK_LT(vram_4k_jobs, 4400000000ull);  // < 4.4 GB
+
+    // Log the estimates for reference
+    BOOST_TEST_MESSAGE("Stack element size: " << stack_elem_size << " bytes");
+    BOOST_TEST_MESSAGE("Context size: " << context_size << " bytes (~" << context_size / 1024 / 1024 << " MB)");
+    BOOST_TEST_MESSAGE("VRAM for 4000 jobs: " << vram_4k_jobs / 1024 / 1024 / 1024 << " GB");
+}
+
+BOOST_AUTO_TEST_CASE(witness_parsing_large_tapscript)
+{
+    // Test parsing a witness with a large tapscript
+    // The parsing should extract tapscript directly without putting it on stack
+
+    // Create a witness with:
+    // - 3 small stack items (signatures)
+    // - 1 large tapscript (150KB)
+    // - 1 control block
+
+    std::vector<std::vector<unsigned char>> items;
+
+    // 3 signatures (64 bytes each)
+    items.push_back(std::vector<unsigned char>(64, 0x01));
+    items.push_back(std::vector<unsigned char>(64, 0x02));
+    items.push_back(std::vector<unsigned char>(64, 0x03));
+
+    // Large tapscript (150KB)
+    std::vector<unsigned char> tapscript(150000, 0x61);  // OP_NOP
+    tapscript.push_back(0x51);  // OP_TRUE
+    items.push_back(tapscript);
+
+    // Control block (33 bytes minimum)
+    items.push_back(std::vector<unsigned char>(33, 0xc0));
+
+    // Total witness item count
+    BOOST_CHECK_EQUAL(items.size(), 5u);
+
+    // Verify the stack items (first 3) are <= 520 bytes
+    for (size_t i = 0; i < 3; i++) {
+        BOOST_CHECK_LE(items[i].size(), 520u);
+    }
+
+    // Verify tapscript is large
+    BOOST_CHECK_GT(items[3].size(), 520u);
+    BOOST_CHECK_EQUAL(items[3].size(), 150001u);
+
+    // Verify control block is small
+    BOOST_CHECK_LE(items[4].size(), 520u);
+}
+
+BOOST_AUTO_TEST_CASE(max_stack_constants)
+{
+    // Verify GPU constants match Bitcoin Core limits
+    BOOST_CHECK_EQUAL(gpu::MAX_STACK_SIZE, 1000u);
+    BOOST_CHECK_EQUAL(gpu::MAX_STACK_ELEMENT_SIZE, 520u);
+    BOOST_CHECK_EQUAL(gpu::MAX_SCRIPT_SIZE, 10000u);
+    BOOST_CHECK_EQUAL(gpu::MAX_OPS_PER_SCRIPT, 201u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

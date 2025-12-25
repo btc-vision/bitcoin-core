@@ -15,10 +15,13 @@ namespace gpu {
 // Script Execution Limits (must match Bitcoin Core consensus rules)
 // ============================================================================
 
+// Stack limits - 520 bytes per element for ALL sigversions
+// The 520-byte limit applies to stack elements (sigs, pubkeys, data)
+// The tapscript itself is passed directly to EvalScript and can be larger
 constexpr uint32_t MAX_STACK_SIZE = 1000;
-constexpr uint32_t MAX_STACK_ELEMENT_SIZE = 520;
+constexpr uint32_t MAX_STACK_ELEMENT_SIZE = 520;            // 520 bytes for all sigversions
 constexpr uint32_t MAX_SCRIPT_SIZE = 10000;
-constexpr uint32_t MAX_SCRIPT_ELEMENT_SIZE = 520;
+constexpr uint32_t MAX_SCRIPT_ELEMENT_SIZE = 520;           // Legacy push limit check
 constexpr uint32_t MAX_OPS_PER_SCRIPT = 201;
 constexpr uint32_t MAX_PUBKEYS_PER_MULTISIG = 20;
 constexpr int64_t MAX_SCRIPT_NUM_LENGTH = 4;  // Default, 5 for locktime
@@ -28,7 +31,10 @@ constexpr int64_t MAX_SCRIPT_NUM_LENGTH = 4;  // Default, 5 for locktime
 // Complex scripts (multisig, P2WSH) fall back to global memory
 constexpr uint32_t GPU_SMALL_STACK_SIZE = 16;   // For simple scripts (~17KB per context)
 
-// Tapscript limits
+// Tapscript limits (BIP342)
+// - The 520-byte element size limit is REMOVED
+// - The 201 opcode limit is REMOVED (replaced by sigop budget)
+// - The 10,000 byte script size limit is REMOVED
 constexpr int64_t TAPSCRIPT_VALIDATION_WEIGHT_PER_SIGOP = 50;
 constexpr int64_t TAPSCRIPT_MAX_VALIDATION_WEIGHT = 4000000; // 4M weight units
 
@@ -167,8 +173,8 @@ constexpr uint8_t GPU_SIGHASH_ANYONECANPAY  = 0x80;
 // ============================================================================
 
 struct GPUStackElement {
-    uint8_t data[MAX_STACK_ELEMENT_SIZE];  // 520 bytes max
-    uint16_t size;                          // Actual size (0-520)
+    uint8_t data[MAX_STACK_ELEMENT_SIZE];  // 10000 bytes for Tapscript support
+    uint16_t size;                          // Actual size
     uint16_t padding;                       // Alignment to 4 bytes
 
     __host__ __device__ GPUStackElement() : size(0), padding(0) {
@@ -519,7 +525,7 @@ struct GPUTxInput {
     // Witness data
     uint32_t witness_offset;      // Offset in witness blob
     uint16_t witness_count;       // Number of witness stack elements
-    uint16_t witness_total_size;
+    uint32_t witness_total_size;  // Total witness data size (needs 32 bits for large tapscripts)
 
     // Transaction context
     uint32_t sequence;

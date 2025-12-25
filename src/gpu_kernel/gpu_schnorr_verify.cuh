@@ -46,7 +46,11 @@ __device__ __host__ inline void tagged_hash(
 
 // Precomputed BIP340 tag hashes (for efficiency)
 // SHA256("BIP0340/challenge")
+#ifdef __CUDA_ARCH__
 __device__ __constant__ const uint8_t BIP340_CHALLENGE_TAG_HASH[32] = {
+#else
+static constexpr uint8_t BIP340_CHALLENGE_TAG_HASH[32] = {
+#endif
     0x7b, 0xb5, 0x2d, 0x7a, 0x9f, 0xef, 0x58, 0x32,
     0x3e, 0xb1, 0xbf, 0x7a, 0x40, 0x7d, 0xb3, 0x82,
     0xd2, 0xf3, 0xf2, 0xd8, 0x1b, 0xb1, 0x22, 0x4f,
@@ -302,43 +306,101 @@ __device__ __host__ inline bool taproot_tweak_pubkey(
 // - 32*k bytes: merkle path (0 <= k <= 128)
 
 // Compute TapLeaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script) || script)
+// Uses incremental hashing to avoid large stack allocation for big tapscripts
 __device__ __host__ inline void compute_tapleaf_hash(
     uint8_t* out,                    // 32 bytes output
     uint8_t leaf_version,
     const uint8_t* script,
     uint32_t script_len)
 {
-    // Build data: leaf_version || compact_size(script) || script
-    // Max script size for this implementation: 10KB
-    constexpr uint32_t MAX_SCRIPT = 10000;
-    if (script_len > MAX_SCRIPT) script_len = MAX_SCRIPT;
+    // Compute SHA256("TapLeaf") at runtime - no precomputed constants
+    uint8_t tapleaf_tag[32];
+    sha256((const uint8_t*)"TapLeaf", 7, tapleaf_tag);
 
-    uint8_t data[1 + 5 + MAX_SCRIPT];  // leaf_version + max compact_size + script
-    uint32_t pos = 0;
-
-    data[pos++] = leaf_version;
+    // Build prefix: leaf_version || compact_size(script_len)
+    uint8_t prefix[6];
+    uint32_t prefix_len = 0;
+    prefix[prefix_len++] = leaf_version;
 
     // Compact size encoding
     if (script_len < 253) {
-        data[pos++] = (uint8_t)script_len;
+        prefix[prefix_len++] = (uint8_t)script_len;
     } else if (script_len <= 0xFFFF) {
-        data[pos++] = 253;
-        data[pos++] = script_len & 0xFF;
-        data[pos++] = (script_len >> 8) & 0xFF;
+        prefix[prefix_len++] = 253;
+        prefix[prefix_len++] = script_len & 0xFF;
+        prefix[prefix_len++] = (script_len >> 8) & 0xFF;
     } else {
-        data[pos++] = 254;
-        data[pos++] = script_len & 0xFF;
-        data[pos++] = (script_len >> 8) & 0xFF;
-        data[pos++] = (script_len >> 16) & 0xFF;
-        data[pos++] = (script_len >> 24) & 0xFF;
+        prefix[prefix_len++] = 254;
+        prefix[prefix_len++] = script_len & 0xFF;
+        prefix[prefix_len++] = (script_len >> 8) & 0xFF;
+        prefix[prefix_len++] = (script_len >> 16) & 0xFF;
+        prefix[prefix_len++] = (script_len >> 24) & 0xFF;
     }
 
-    // Copy script
+    // Initialize SHA256 with standard IV
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+
+    // Total length = 64 (two tag hashes) + prefix_len + script_len
+    uint64_t total_len = 64 + prefix_len + script_len;
+
+    // First block: SHA256("TapLeaf") || SHA256("TapLeaf") (64 bytes exactly)
+    uint8_t block[64];
+    for (int i = 0; i < 32; i++) block[i] = tapleaf_tag[i];
+    for (int i = 0; i < 32; i++) block[32 + i] = tapleaf_tag[i];
+    sha256_transform(state, block);
+
+    // Process remaining data in 64-byte blocks
+    uint32_t block_pos = 0;
+
+    // Add prefix
+    for (uint32_t i = 0; i < prefix_len; i++) {
+        block[block_pos++] = prefix[i];
+        if (block_pos == 64) {
+            sha256_transform(state, block);
+            block_pos = 0;
+        }
+    }
+
+    // Add script
     for (uint32_t i = 0; i < script_len; i++) {
-        data[pos++] = script[i];
+        block[block_pos++] = script[i];
+        if (block_pos == 64) {
+            sha256_transform(state, block);
+            block_pos = 0;
+        }
     }
 
-    tagged_hash(out, "TapLeaf", data, pos);
+    // Pad and finalize
+    block[block_pos++] = 0x80;
+    if (block_pos > 56) {
+        while (block_pos < 64) block[block_pos++] = 0;
+        sha256_transform(state, block);
+        block_pos = 0;
+    }
+    while (block_pos < 56) block[block_pos++] = 0;
+
+    // Append length in bits (big-endian)
+    uint64_t bit_len = total_len * 8;
+    block[56] = (bit_len >> 56) & 0xFF;
+    block[57] = (bit_len >> 48) & 0xFF;
+    block[58] = (bit_len >> 40) & 0xFF;
+    block[59] = (bit_len >> 32) & 0xFF;
+    block[60] = (bit_len >> 24) & 0xFF;
+    block[61] = (bit_len >> 16) & 0xFF;
+    block[62] = (bit_len >> 8) & 0xFF;
+    block[63] = bit_len & 0xFF;
+    sha256_transform(state, block);
+
+    // Output hash (big-endian)
+    for (int i = 0; i < 8; i++) {
+        out[i * 4 + 0] = (state[i] >> 24) & 0xFF;
+        out[i * 4 + 1] = (state[i] >> 16) & 0xFF;
+        out[i * 4 + 2] = (state[i] >> 8) & 0xFF;
+        out[i * 4 + 3] = state[i] & 0xFF;
+    }
 }
 
 // Compute TapBranch hash: tagged_hash("TapBranch", sorted(left, right))
@@ -411,15 +473,11 @@ __device__ __host__ inline bool verify_taproot_script_path(
 
     // Parse internal key
     AffinePoint internal;
-    if (!pubkey_parse_xonly(internal, internal_pubkey)) {
-        return false;
-    }
+    if (!pubkey_parse_xonly(internal, internal_pubkey)) return false;
 
     // Compute tweaked key P' = internal + tweak*G
     AffinePoint tweaked;
-    if (!taproot_tweak_pubkey(tweaked, internal, current_hash)) {
-        return false;
-    }
+    if (!taproot_tweak_pubkey(tweaked, internal, current_hash)) return false;
 
     // Get x-coordinate and parity of tweaked key
     uint8_t tweaked_x[32];
@@ -431,9 +489,7 @@ __device__ __host__ inline bool verify_taproot_script_path(
     }
 
     // Check parity matches
-    // The y-coordinate parity is determined by whether y is odd
     uint8_t tweaked_parity = tweaked.y.IsOdd() ? 1 : 0;
-
     if (tweaked_parity != output_parity) return false;
 
     return true;

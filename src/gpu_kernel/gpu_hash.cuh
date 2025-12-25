@@ -12,9 +12,12 @@ namespace gpu {
 // SHA-256 Implementation
 // ============================================================================
 
-// SHA-256 constants - available on both host and device
-// Note: On device, this will be placed in constant memory by the compiler when appropriate
-__device__ __host__ static constexpr uint32_t K256[64] = {
+// SHA-256 constants - separate host and device versions to avoid CUDA warnings
+#ifdef __CUDA_ARCH__
+__device__ static const uint32_t K256[64] = {
+#else
+static constexpr uint32_t K256[64] = {
+#endif
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -85,22 +88,28 @@ __device__ __host__ inline void sha256_transform(uint32_t state[8], const uint8_
     uint32_t a, b, c, d, e, f, g, h;
     
     // Prepare message schedule
+#ifdef __CUDA_ARCH__
     #pragma unroll 16
+#endif
     for (int i = 0; i < 16; i++) {
         W[i] = bswap32(((uint32_t*)block)[i]);
     }
-    
+
+#ifdef __CUDA_ARCH__
     #pragma unroll 48
+#endif
     for (int i = 16; i < 64; i++) {
         W[i] = sigma1(W[i-2]) + W[i-7] + sigma0(W[i-15]) + W[i-16];
     }
-    
+
     // Initialize working variables
     a = state[0]; b = state[1]; c = state[2]; d = state[3];
     e = state[4]; f = state[5]; g = state[6]; h = state[7];
-    
+
     // Main loop
+#ifdef __CUDA_ARCH__
     #pragma unroll 64
+#endif
     for (int i = 0; i < 64; i++) {
         uint32_t T1 = h + Sigma1(e) + Ch(e, f, g) + K256[i] + W[i];
         uint32_t T2 = Sigma0(a) + Maj(a, b, c);

@@ -135,7 +135,62 @@ BOOST_AUTO_TEST_CASE(gpu_sighash_legacy_anyonecanpay)
 
 // =============================================================================
 // BIP143 SegWit v0 Sighash Tests
+// IMPORTANT: BIP143 requires proper scriptCode, NOT the raw scriptPubKey!
+// P2WPKH: scriptCode = OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
+// P2WSH: scriptCode = the witness script
 // =============================================================================
+
+BOOST_AUTO_TEST_CASE(gpu_sighash_bip143_p2wpkh_scriptcode)
+{
+    // This test verifies that using the proper scriptCode produces different
+    // results than using the raw scriptPubKey. The bug was using scriptPubKey
+    // directly which caused all ECDSA verifications to fail.
+    CMutableTransaction tx;
+    tx.version = 2;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint(Txid::FromUint256(GetRandHash()), 0);
+    tx.vin[0].nSequence = 0xFFFFFFFF;
+    tx.vout.resize(1);
+    tx.vout[0].nValue = 100000000;
+    tx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+
+    CKey key;
+    key.MakeNewKey(true);
+    CPubKey pubkey = key.GetPubKey();
+
+    // Raw P2WPKH scriptPubKey: OP_0 <20-byte-hash>
+    CScript scriptPubKey = CreateP2WPKHScript(pubkey);
+    BOOST_CHECK_EQUAL(scriptPubKey.size(), 22u);
+    BOOST_CHECK_EQUAL(scriptPubKey[0], OP_0);
+    BOOST_CHECK_EQUAL(scriptPubKey[1], 0x14);  // 20-byte push
+
+    // Proper scriptCode for P2WPKH: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
+    CScript scriptCode;
+    scriptCode << OP_DUP << OP_HASH160 << ToByteVector(pubkey.GetID()) << OP_EQUALVERIFY << OP_CHECKSIG;
+    BOOST_CHECK_EQUAL(scriptCode.size(), 25u);
+
+    CAmount amount = 200000000;
+
+    std::vector<CTxOut> spent_outputs;
+    spent_outputs.push_back(CTxOut(amount, scriptPubKey));
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, std::move(spent_outputs));
+
+    // Compute hash with wrong input (raw scriptPubKey) - this is the BUG
+    uint256 wrong_hash = SignatureHash(scriptPubKey, tx, 0, SIGHASH_ALL, amount, SigVersion::WITNESS_V0, &txdata);
+
+    // Compute hash with correct input (proper scriptCode)
+    uint256 correct_hash = SignatureHash(scriptCode, tx, 0, SIGHASH_ALL, amount, SigVersion::WITNESS_V0, &txdata);
+
+    // Both should be non-zero
+    BOOST_CHECK(wrong_hash != uint256::ZERO);
+    BOOST_CHECK(correct_hash != uint256::ZERO);
+
+    // CRITICAL: They MUST be different! Using scriptPubKey produces wrong sighash.
+    BOOST_CHECK_MESSAGE(wrong_hash != correct_hash,
+        "BIP143 sighash with scriptPubKey should differ from scriptCode!");
+}
 
 BOOST_AUTO_TEST_CASE(gpu_sighash_bip143_p2wpkh)
 {
@@ -143,25 +198,30 @@ BOOST_AUTO_TEST_CASE(gpu_sighash_bip143_p2wpkh)
     tx.version = 2;
     tx.vin.resize(1);
     tx.vin[0].prevout = COutPoint(Txid::FromUint256(GetRandHash()), 0);
-        tx.vin[0].nSequence = 0xFFFFFFFF;
+    tx.vin[0].nSequence = 0xFFFFFFFF;
     tx.vout.resize(1);
     tx.vout[0].nValue = 100000000;
     tx.vout[0].scriptPubKey = CScript() << OP_TRUE;
 
     CKey key;
     key.MakeNewKey(true);
-    CScript scriptPubKey = CreateP2WPKHScript(key.GetPubKey());
+    CPubKey pubkey = key.GetPubKey();
+    CScript scriptPubKey = CreateP2WPKHScript(pubkey);
+
+    // Construct proper scriptCode (what SignatureHash actually needs)
+    CScript scriptCode;
+    scriptCode << OP_DUP << OP_HASH160 << ToByteVector(pubkey.GetID()) << OP_EQUALVERIFY << OP_CHECKSIG;
 
     CAmount amount = 200000000;
 
-    // For BIP143, we need PrecomputedTransactionData
     std::vector<CTxOut> spent_outputs;
     spent_outputs.push_back(CTxOut(amount, scriptPubKey));
 
     PrecomputedTransactionData txdata;
     txdata.Init(tx, std::move(spent_outputs));
 
-    uint256 cpu_hash = SignatureHash(scriptPubKey, tx, 0, SIGHASH_ALL, amount, SigVersion::WITNESS_V0, &txdata);
+    // Use proper scriptCode, not raw scriptPubKey
+    uint256 cpu_hash = SignatureHash(scriptCode, tx, 0, SIGHASH_ALL, amount, SigVersion::WITNESS_V0, &txdata);
 
     BOOST_CHECK(cpu_hash != uint256::ZERO);
 }
