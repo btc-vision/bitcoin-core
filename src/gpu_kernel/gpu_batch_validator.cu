@@ -656,6 +656,10 @@ __device__ inline bool ValidateSimpleScript(
                 job.valid = false;
                 return true;
             }
+            // Safety check: witness_count > 0 but witness_total_size == 0 is inconsistent
+            if (job.witness_total_size == 0) {
+                return false;  // Fall back to CPU
+            }
 
             // Parse witness: [sig_len, sig..., pubkey_len, pubkey...]
             const uint8_t* ptr = witness;
@@ -743,8 +747,14 @@ __device__ inline bool ValidateSimpleScript(
             // P2TR script-path: witness = [..., script, control_block]
             if (job.witness_count == 1) {
                 // Key-path spend
+                // Safety check: witness_count > 0 but witness_total_size == 0 is inconsistent
+                if (job.witness_total_size == 0) {
+                    // Data inconsistency - fall back to CPU for safety
+                    return false;
+                }
                 uint8_t sig_len = witness[0];
                 if (sig_len != 64 && sig_len != 65) {
+                    printf("[GPU DEBUG] SCHNORR_SIG_SIZE error: expected 64 or 65, got %u\n", sig_len);
                     job.error = GPU_SCRIPT_ERR_SCHNORR_SIG_SIZE;
                     job.valid = false;
                     return true;

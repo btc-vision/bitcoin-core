@@ -3,9 +3,13 @@
 #include "gpu_utils.h"
 #include "gpu_hash.cuh"
 #include "gpu_logging.h"
+#include "gpu_direct_storage.h"
 #include <cuda.h>
 #include <cstring>
 #include <random>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Helper functions for logging
 static inline void LogGPUMessage(const std::string& msg) {
@@ -93,6 +97,47 @@ GPUUTXOSet::~GPUUTXOSet() {
     m_staged_adds = nullptr;
     m_staged_removes = nullptr;
     m_staged_restores = nullptr;
+
+    // Free dirty tracking array
+    delete[] m_dirty_indices;
+    m_dirty_indices = nullptr;
+    m_dirty_count = 0;
+    m_dirty_capacity = 0;
+}
+
+// Mark a UTXO index as dirty (modified since last flush)
+void GPUUTXOSet::MarkDirty(uint32_t index) {
+    // Skip if this is a newly added UTXO (will be flushed with new data anyway)
+    if (index >= m_flush_numUTXOs) {
+        return;  // This is a new entry, not a modification of existing
+    }
+
+    // Expand capacity if needed
+    if (m_dirty_count >= m_dirty_capacity) {
+        size_t new_capacity = m_dirty_capacity + DIRTY_TRACK_INCREMENT;
+        uint32_t* new_array = new uint32_t[new_capacity];
+        if (m_dirty_indices) {
+            memcpy(new_array, m_dirty_indices, m_dirty_count * sizeof(uint32_t));
+            delete[] m_dirty_indices;
+        }
+        m_dirty_indices = new_array;
+        m_dirty_capacity = new_capacity;
+    }
+
+    // Check for duplicates (simple linear scan - could use a set for larger counts)
+    for (size_t i = 0; i < m_dirty_count; i++) {
+        if (m_dirty_indices[i] == index) {
+            return;  // Already tracked
+        }
+    }
+
+    m_dirty_indices[m_dirty_count++] = index;
+}
+
+// Clear dirty tracking (called after successful flush)
+void GPUUTXOSet::ClearDirtyTracking() {
+    m_dirty_count = 0;
+    // Keep the allocated buffer for reuse
 }
 
 // Get available VRAM
@@ -331,17 +376,20 @@ bool GPUUTXOSet::SpendUTXO(const uint256& txid, uint32_t vout) {
             cudaMemcpy(&stored_txid, d_txidTable + header.txid_index, sizeof(uint256_gpu), cudaMemcpyDeviceToHost);
             
             if (FromGPU(stored_txid) == txid && header.vout == vout) {
-                // Mark as spent
-                header.flags |= UTXO_FLAG_SPENT;
+                // Mark as spent and dirty for incremental flush
+                header.flags |= UTXO_FLAG_SPENT | UTXO_FLAG_DIRTY;
                 cudaMemcpy(d_headers + index, &header, sizeof(UTXOHeader), cudaMemcpyHostToDevice);
-                
+
+                // Track for incremental disk flushing
+                MarkDirty(index);
+
                 // Track freed space
                 totalFreeSpace += header.script_size;
-                
+
                 // Clear from hash table
                 uint32_t empty = 0xFFFFFFFF;
                 cudaMemcpy(d_hashTables[i] + hashes[i], &empty, sizeof(uint32_t), cudaMemcpyHostToDevice);
-                
+
                 return true;
             }
         }
@@ -806,5 +854,304 @@ bool GPUUTXOSet::GetUTXO(const uint256& txid, uint32_t vout, UTXOHeader& header,
 
 // Note: LoadFromCPU() is implemented in gpu_utxo_loader.cu
 // Note: Compact() is implemented in gpu_utxo_compact.cu
+
+// =========================================================================
+// GPUDirect Storage Persistence Implementation
+// =========================================================================
+
+bool GPUUTXOSet::SaveToDisk(const std::string& datadir, uint64_t block_height, const uint8_t* block_hash) {
+    LogGPUMessage("Saving GPU UTXO set to disk at height " + std::to_string(block_height));
+
+    // Get the GPUDirect Storage instance
+    GPUDirectStorage& gds = GetGPUDirectStorage();
+
+    // Initialize GDS if not already
+    if (!gds.IsInitialized()) {
+        GDSConfig config = GDSConfig::GetDefaults(datadir);
+        if (!gds.Initialize(config)) {
+            LogGPUError("Failed to initialize GPUDirect Storage");
+            return false;
+        }
+    }
+
+    // Save the UTXO set using GPUDirect Storage
+    bool success = gds.SaveUTXOSet(
+        d_headers,
+        numUTXOs,
+        d_scriptBlob,
+        scriptBlobUsed,
+        d_txidTable,
+        txidTableUsed,
+        const_cast<const uint32_t* const*>(d_hashTables),
+        TABLE_SIZE,
+        block_height,
+        block_hash
+    );
+
+    if (success) {
+        m_datadir = datadir;
+        m_last_flushed_height = block_height;
+
+        // Update incremental flush tracking state
+        m_flush_numUTXOs = numUTXOs;
+        m_flush_scriptBlobUsed = scriptBlobUsed;
+        m_flush_txidTableUsed = txidTableUsed;
+        ClearDirtyTracking();
+
+        LogGPUMessage("GPU UTXO set saved successfully");
+    } else {
+        LogGPUError("Failed to save GPU UTXO set");
+    }
+
+    return success;
+}
+
+bool GPUUTXOSet::LoadFromDisk(const std::string& datadir, uint64_t& block_height, uint8_t* block_hash) {
+    LogGPUMessage("Loading GPU UTXO set from disk...");
+
+    // Get the GPUDirect Storage instance
+    GPUDirectStorage& gds = GetGPUDirectStorage();
+
+    // Initialize GDS if not already
+    if (!gds.IsInitialized()) {
+        GDSConfig config = GDSConfig::GetDefaults(datadir);
+        if (!gds.Initialize(config)) {
+            LogGPUError("Failed to initialize GPUDirect Storage");
+            return false;
+        }
+    }
+
+    // Make sure GPU memory is allocated
+    if (!d_headers) {
+        if (!Initialize()) {
+            LogGPUError("Failed to allocate GPU memory for UTXO set");
+            return false;
+        }
+    }
+
+    // Load the UTXO set using GPUDirect Storage
+    size_t loaded_headers = 0;
+    size_t loaded_scripts = 0;
+    size_t loaded_txids = 0;
+
+    bool success = gds.LoadUTXOSet(
+        d_headers,
+        loaded_headers,
+        maxUTXOs,
+        d_scriptBlob,
+        loaded_scripts,
+        scriptBlobSize,
+        d_txidTable,
+        loaded_txids,
+        txidTableSize,
+        d_hashTables,
+        TABLE_SIZE,
+        block_height,
+        block_hash
+    );
+
+    if (success) {
+        numUTXOs = loaded_headers;
+        scriptBlobUsed = loaded_scripts;
+        txidTableUsed = loaded_txids;
+        m_datadir = datadir;
+        m_last_flushed_height = block_height;
+
+        // Initialize incremental flush tracking state
+        m_flush_numUTXOs = numUTXOs;
+        m_flush_scriptBlobUsed = scriptBlobUsed;
+        m_flush_txidTableUsed = txidTableUsed;
+        ClearDirtyTracking();
+
+        LogGPUMessage("GPU UTXO set loaded: " + std::to_string(numUTXOs) +
+                     " UTXOs at height " + std::to_string(block_height));
+    } else {
+        LogGPUError("Failed to load GPU UTXO set from disk");
+    }
+
+    return success;
+}
+
+bool GPUUTXOSet::HasDiskSnapshot(const std::string& datadir) {
+    GDSConfig config = GDSConfig::GetDefaults(datadir);
+
+    // Check if all required files exist
+    struct stat st;
+    if (stat(config.utxo_headers_path.c_str(), &st) != 0) return false;
+    if (stat(config.utxo_scripts_path.c_str(), &st) != 0) return false;
+    if (stat(config.utxo_txids_path.c_str(), &st) != 0) return false;
+    if (stat(config.utxo_hashtables_path.c_str(), &st) != 0) return false;
+
+    return true;
+}
+
+bool GPUUTXOSet::GetDiskSnapshotHeight(const std::string& datadir, uint64_t& block_height) {
+    GDSConfig config = GDSConfig::GetDefaults(datadir);
+
+    // Open headers file and read just the header
+    int fd = open(config.utxo_headers_path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+
+    UTXOFileHeader file_header;
+    ssize_t bytes_read = read(fd, &file_header, sizeof(file_header));
+    close(fd);
+
+    if (bytes_read != sizeof(file_header)) return false;
+    if (!file_header.IsValid()) return false;
+
+    block_height = file_header.block_height;
+    return true;
+}
+
+bool GPUUTXOSet::FlushToDisk() {
+    if (m_datadir.empty()) {
+        LogGPUError("Cannot flush: datadir not set. Call SaveToDisk first.");
+        return false;
+    }
+
+    // Check if there's anything to flush
+    size_t new_headers = numUTXOs - m_flush_numUTXOs;
+    size_t new_scripts = scriptBlobUsed - m_flush_scriptBlobUsed;
+    bool has_dirty = m_dirty_count > 0;
+
+    if (new_headers == 0 && new_scripts == 0 && !has_dirty) {
+        // Nothing to flush
+        return true;
+    }
+
+    LogGPUMessage("Incremental flush: " + std::to_string(new_headers) + " new headers, " +
+                  std::to_string(new_scripts) + " bytes new scripts, " +
+                  std::to_string(m_dirty_count) + " dirty entries");
+
+    // Get the GPUDirect Storage instance
+    GPUDirectStorage& gds = GetGPUDirectStorage();
+    if (!gds.IsInitialized()) {
+        LogGPUError("GPUDirect Storage not initialized for incremental flush");
+        // Fall back to full save
+        return SaveToDisk(m_datadir, m_last_flushed_height, nullptr);
+    }
+
+    bool success = true;
+
+    // =========================================================================
+    // Step 1: Append new UTXO headers
+    // =========================================================================
+    if (new_headers > 0 && success) {
+        success = gds.AppendHeaders(
+            d_headers + m_flush_numUTXOs,
+            new_headers,
+            m_flush_numUTXOs
+        );
+        if (!success) {
+            LogGPUError("Failed to append " + std::to_string(new_headers) + " new headers");
+        }
+    }
+
+    // =========================================================================
+    // Step 2: Append new script data
+    // =========================================================================
+    if (new_scripts > 0 && success) {
+        success = gds.AppendScripts(
+            d_scriptBlob + m_flush_scriptBlobUsed,
+            new_scripts,
+            m_flush_scriptBlobUsed
+        );
+        if (!success) {
+            LogGPUError("Failed to append " + std::to_string(new_scripts) + " bytes of script data");
+        }
+    }
+
+    // =========================================================================
+    // Step 3: Write dirty headers (modified existing entries, e.g., spent UTXOs)
+    // =========================================================================
+    if (has_dirty && success) {
+        // For each dirty entry, we need to update the header on disk
+        // This is less efficient than batch updates, but ensures correctness
+        GDSConfig config = GDSConfig::GetDefaults(m_datadir);
+
+        for (size_t i = 0; i < m_dirty_count && success; i++) {
+            uint32_t dirty_index = m_dirty_indices[i];
+
+            // Read the header from GPU
+            UTXOHeader header;
+            cudaMemcpy(&header, d_headers + dirty_index, sizeof(UTXOHeader), cudaMemcpyDeviceToHost);
+
+            // Clear the dirty flag before writing
+            header.flags &= ~UTXO_FLAG_DIRTY;
+
+            // Write directly to the file at the correct offset
+            // File format: UTXOFileHeader (128 bytes) + headers array
+            off_t file_offset = sizeof(UTXOFileHeader) + dirty_index * sizeof(UTXOHeader);
+
+            int fd = open(config.utxo_headers_path.c_str(), O_WRONLY);
+            if (fd < 0) {
+                LogGPUError("Failed to open headers file for dirty write");
+                success = false;
+                break;
+            }
+
+            ssize_t written = pwrite(fd, &header, sizeof(UTXOHeader), file_offset);
+            close(fd);
+
+            if (written != sizeof(UTXOHeader)) {
+                LogGPUError("Failed to write dirty header at index " + std::to_string(dirty_index));
+                success = false;
+                break;
+            }
+
+            // Also update the GPU copy to clear the dirty flag
+            cudaMemcpy(d_headers + dirty_index, &header, sizeof(UTXOHeader), cudaMemcpyHostToDevice);
+        }
+    }
+
+    // =========================================================================
+    // Step 4: Update file header with new counts
+    // =========================================================================
+    if (success) {
+        GDSConfig config = GDSConfig::GetDefaults(m_datadir);
+
+        int fd = open(config.utxo_headers_path.c_str(), O_RDWR);
+        if (fd >= 0) {
+            UTXOFileHeader file_header;
+            if (read(fd, &file_header, sizeof(file_header)) == sizeof(file_header)) {
+                file_header.num_entries = numUTXOs;
+                file_header.data_size = numUTXOs * sizeof(UTXOHeader);
+                lseek(fd, 0, SEEK_SET);
+                write(fd, &file_header, sizeof(file_header));
+            }
+            close(fd);
+        }
+
+        // Similarly update scripts file header
+        fd = open(config.utxo_scripts_path.c_str(), O_RDWR);
+        if (fd >= 0) {
+            UTXOFileHeader file_header;
+            if (read(fd, &file_header, sizeof(file_header)) == sizeof(file_header)) {
+                file_header.data_size = scriptBlobUsed;
+                lseek(fd, 0, SEEK_SET);
+                write(fd, &file_header, sizeof(file_header));
+            }
+            close(fd);
+        }
+    }
+
+    // =========================================================================
+    // Step 5: Update flush tracking state on success
+    // =========================================================================
+    if (success) {
+        m_flush_numUTXOs = numUTXOs;
+        m_flush_scriptBlobUsed = scriptBlobUsed;
+        m_flush_txidTableUsed = txidTableUsed;
+        ClearDirtyTracking();
+
+        LogGPUMessage("Incremental flush completed successfully");
+    } else {
+        LogGPUError("Incremental flush failed, falling back to full save");
+        // Fall back to full save
+        return SaveToDisk(m_datadir, m_last_flushed_height, nullptr);
+    }
+
+    return true;
+}
 
 } // namespace gpu

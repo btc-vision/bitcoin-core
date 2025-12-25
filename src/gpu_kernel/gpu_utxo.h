@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include <cuda_runtime.h>
 #include "gpu_types.h"
 
@@ -111,15 +112,53 @@ public:
     size_t GetFreeSpace() const { return totalFreeSpace; }
     bool NeedsCompaction() const { return totalFreeSpace > (totalVRAMUsed * 0.1); }
     bool Compact();
-    
+
     // Statistics
     size_t GetNumUTXOs() const { return numUTXOs; }
     size_t GetMaxUTXOs() const { return maxUTXOs; }
     size_t GetScriptBlobUsed() const { return scriptBlobUsed; }
+    size_t GetScriptBlobSize() const { return scriptBlobSize; }
     size_t GetTotalVRAMUsed() const { return totalVRAMUsed; }
     size_t GetTotalFreeSpace() const { return totalFreeSpace; }
     size_t GetTxidTableUsed() const { return txidTableUsed; }
+    size_t GetTxidTableSize() const { return txidTableSize; }
     double GetLoadFactor() const;
+
+    // =========================================================================
+    // GPUDirect Storage Persistence (Direct GPU-to-Disk I/O)
+    // =========================================================================
+
+    // Save UTXO set directly from GPU memory to disk using GPUDirect Storage
+    // This bypasses CPU entirely for maximum performance
+    bool SaveToDisk(const std::string& datadir, uint64_t block_height, const uint8_t* block_hash);
+
+    // Load UTXO set directly from disk to GPU memory using GPUDirect Storage
+    bool LoadFromDisk(const std::string& datadir, uint64_t& block_height, uint8_t* block_hash);
+
+    // Check if a valid UTXO snapshot exists on disk
+    static bool HasDiskSnapshot(const std::string& datadir);
+
+    // Get the block height of the on-disk snapshot (without loading)
+    static bool GetDiskSnapshotHeight(const std::string& datadir, uint64_t& block_height);
+
+    // =========================================================================
+    // Incremental Persistence (for continuous disk updates)
+    // =========================================================================
+
+    // Flush pending changes to disk (call periodically or after batch commit)
+    bool FlushToDisk();
+
+    // Enable/disable automatic disk flushing after each block
+    void SetAutoFlush(bool enabled) { m_auto_flush = enabled; }
+    bool GetAutoFlush() const { return m_auto_flush; }
+
+    // Get device pointers (for GPUDirect Storage direct access)
+    UTXOHeader* GetHeadersPtr() { return d_headers; }
+    const UTXOHeader* GetHeadersPtr() const { return d_headers; }
+    uint8_t* GetScriptBlobPtr() { return d_scriptBlob; }
+    const uint8_t* GetScriptBlobPtr() const { return d_scriptBlob; }
+    uint256_gpu* GetTxidTablePtr() { return d_txidTable; }
+    const uint256_gpu* GetTxidTablePtr() const { return d_txidTable; }
 
 public:
     // Hash table operations (public for testing)
@@ -196,6 +235,31 @@ private:
     size_t m_snapshot_numUTXOs{0};
     size_t m_snapshot_scriptBlobUsed{0};
     size_t m_snapshot_txidTableUsed{0};
+
+    // GPUDirect Storage persistence
+    bool m_auto_flush{false};
+    std::string m_datadir;
+    uint64_t m_last_flushed_height{0};
+
+    // =========================================================================
+    // Incremental flushing tracking
+    // =========================================================================
+
+    // Track the state at last flush for incremental updates
+    size_t m_flush_numUTXOs{0};           // numUTXOs at last flush
+    size_t m_flush_scriptBlobUsed{0};     // scriptBlobUsed at last flush
+    size_t m_flush_txidTableUsed{0};      // txidTableUsed at last flush
+
+    // Track dirty UTXO indices (UTXOs modified since last flush)
+    // These are indices of existing UTXOs that were modified (e.g., spent)
+    uint32_t* m_dirty_indices{nullptr};
+    size_t m_dirty_count{0};
+    size_t m_dirty_capacity{0};
+    static constexpr size_t DIRTY_TRACK_INCREMENT = 10000;
+
+    // Helper to track a modified UTXO index
+    void MarkDirty(uint32_t index);
+    void ClearDirtyTracking();
 
     // Memory allocation helpers
     bool AllocateDeviceMemory();

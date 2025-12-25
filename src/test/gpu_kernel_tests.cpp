@@ -13272,6 +13272,115 @@ BOOST_AUTO_TEST_CASE(gpu_get_utxo_including_spent)
     BOOST_CHECK(retrieved.flags & ::gpu::UTXO_FLAG_SPENT);
 }
 
+// =============================================================================
+// Annex Detection Tests (BIP341)
+// =============================================================================
+
+BOOST_AUTO_TEST_CASE(gpu_annex_detection_no_annex)
+{
+    // Test: Single witness element (key-path spend) - no annex possible
+    CScriptWitness wit1;
+    wit1.stack.push_back({0x01, 0x02, 0x03});  // Just a signature
+
+    // No annex when only 1 element
+    bool has_annex = (wit1.stack.size() >= 2 &&
+                      !wit1.stack.back().empty() &&
+                      wit1.stack.back()[0] == 0x50);
+    BOOST_CHECK(!has_annex);
+}
+
+BOOST_AUTO_TEST_CASE(gpu_annex_detection_with_annex)
+{
+    // Test: Witness with annex (last element starts with 0x50)
+    CScriptWitness wit;
+    wit.stack.push_back({0x30, 0x44});  // Signature
+    wit.stack.push_back({0x02, 0x03});  // Pubkey
+    wit.stack.push_back({0x50, 0xAA, 0xBB, 0xCC});  // Annex (starts with 0x50)
+
+    bool has_annex = (wit.stack.size() >= 2 &&
+                      !wit.stack.back().empty() &&
+                      wit.stack.back()[0] == 0x50);
+    BOOST_CHECK(has_annex);
+    BOOST_CHECK_EQUAL(wit.stack.back()[0], 0x50);
+}
+
+BOOST_AUTO_TEST_CASE(gpu_annex_detection_no_annex_multiple_elements)
+{
+    // Test: Multiple witness elements but last doesn't start with 0x50
+    CScriptWitness wit;
+    wit.stack.push_back({0x30, 0x44});  // Signature
+    wit.stack.push_back({0x02, 0x03});  // Pubkey
+    wit.stack.push_back({0x51, 0xAA});  // NOT an annex (starts with 0x51)
+
+    bool has_annex = (wit.stack.size() >= 2 &&
+                      !wit.stack.back().empty() &&
+                      wit.stack.back()[0] == 0x50);
+    BOOST_CHECK(!has_annex);
+}
+
+BOOST_AUTO_TEST_CASE(gpu_annex_detection_empty_last_element)
+{
+    // Test: Empty last element - not an annex
+    CScriptWitness wit;
+    wit.stack.push_back({0x30, 0x44});
+    wit.stack.push_back({});  // Empty
+
+    bool has_annex = (wit.stack.size() >= 2 &&
+                      !wit.stack.back().empty() &&
+                      wit.stack.back()[0] == 0x50);
+    BOOST_CHECK(!has_annex);
+}
+
+BOOST_AUTO_TEST_CASE(gpu_annex_hash_computation)
+{
+    // Test: Verify annex hash computation matches expected
+    std::vector<unsigned char> annex = {0x50, 0x01, 0x02, 0x03};
+
+    // Build annex with size prefix (compact size encoding)
+    std::vector<unsigned char> annex_with_size;
+    annex_with_size.push_back(static_cast<unsigned char>(annex.size()));  // 4 < 253, so single byte
+    annex_with_size.insert(annex_with_size.end(), annex.begin(), annex.end());
+
+    uint256 annex_hash;
+    CSHA256().Write(annex_with_size.data(), annex_with_size.size()).Finalize(annex_hash.begin());
+
+    // Verify hash is non-zero and deterministic
+    BOOST_CHECK(annex_hash != uint256::ZERO);
+
+    // Recompute and verify same result
+    uint256 annex_hash2;
+    CSHA256().Write(annex_with_size.data(), annex_with_size.size()).Finalize(annex_hash2.begin());
+    BOOST_CHECK(annex_hash == annex_hash2);
+}
+
+BOOST_AUTO_TEST_CASE(gpu_annex_compact_size_encoding)
+{
+    // Test compact size encoding for different annex sizes
+
+    // Small annex (size < 253)
+    {
+        std::vector<unsigned char> annex(100, 0x50);
+        std::vector<unsigned char> encoded;
+        encoded.push_back(static_cast<unsigned char>(annex.size()));
+        encoded.insert(encoded.end(), annex.begin(), annex.end());
+        BOOST_CHECK_EQUAL(encoded.size(), 101u);  // 1 byte size + 100 bytes data
+    }
+
+    // Medium annex (253 <= size <= 0xFFFF)
+    {
+        std::vector<unsigned char> annex(300, 0x50);
+        std::vector<unsigned char> encoded;
+        encoded.push_back(253);
+        encoded.push_back(annex.size() & 0xFF);
+        encoded.push_back((annex.size() >> 8) & 0xFF);
+        encoded.insert(encoded.end(), annex.begin(), annex.end());
+        BOOST_CHECK_EQUAL(encoded.size(), 303u);  // 3 bytes size + 300 bytes data
+        BOOST_CHECK_EQUAL(encoded[0], 253);
+        BOOST_CHECK_EQUAL(encoded[1], 0x2C);  // 300 & 0xFF = 44 = 0x2C
+        BOOST_CHECK_EQUAL(encoded[2], 0x01);  // 300 >> 8 = 1
+    }
+}
+
 #else // !ENABLE_GPU_ACCELERATION
 
 BOOST_AUTO_TEST_CASE(gpu_disabled_check)

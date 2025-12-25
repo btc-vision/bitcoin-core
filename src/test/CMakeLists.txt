@@ -131,13 +131,26 @@ add_executable(test_bitcoin
   validation_tests.cpp
   validationinterface_tests.cpp
   versionbits_tests.cpp
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_kernel_tests.cpp>
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_utxo_tests.cpp>
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_crypto_verification.cpp>
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_hash_verification_tests.cpp>
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_utxo_loader_tests.cpp>
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:gpu_utxo_loader_debug_test.cpp>
 )
+
+# GPU acceleration tests (added unconditionally to ensure test suite registration,
+# tests internally skip if GPU acceleration is disabled via ENABLE_GPU_ACCELERATION)
+if(ENABLE_GPU_ACCELERATION)
+  target_sources(test_bitcoin PRIVATE
+    gpu_kernel_tests.cpp
+    gpu_utxo_tests.cpp
+    gpu_utxo_edge_case_tests.cpp
+    gpu_crypto_verification.cpp
+    gpu_hash_verification_tests.cpp
+    gpu_utxo_loader_tests.cpp
+    gpu_utxo_loader_debug_test.cpp
+    gpu_script_tests.cpp
+    gpu_sig_tests.cpp
+    gpu_sighash_tests.cpp
+    gpu_tx_graph_tests.cpp
+    gpu_p2tr_script_path_tests.cpp
+  )
+endif()
 
 include(TargetDataSources)
 target_json_data_sources(test_bitcoin

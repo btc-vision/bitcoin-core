@@ -19,6 +19,10 @@ if(ENABLE_GPU_ACCELERATION)
     gpu_utxo_compact.cu
     gpu_utxo_wrapper.cpp
 
+    # GPUDirect Storage (direct GPU-to-disk I/O)
+    gpu_direct_storage.h
+    gpu_direct_storage.cu
+
     # Script validation
     gpu_validation.cu
     gpu_validation.h
@@ -51,6 +55,10 @@ if(ENABLE_GPU_ACCELERATION)
     gpu_batch_validator.h
     gpu_batch_validator.cu
 
+    # Phase 7: Transaction dependency graph for parallel batching
+    gpu_tx_graph.h
+    gpu_tx_graph.cpp
+
     # Test helpers
     gpu_hash_test_kernels.cu
   )
@@ -76,8 +84,23 @@ if(ENABLE_GPU_ACCELERATION)
     $<$<COMPILE_LANGUAGE:CUDA>:--threads 0 --expt-relaxed-constexpr -UNDEBUG --std=c++20>
   )
   
+  # Find cuFile library for GPUDirect Storage
+  find_library(CUFILE_LIBRARY cufile
+    HINTS ${CMAKE_CUDA_TOOLKIT_ROOT_DIR}/lib64
+          ${CMAKE_CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib
+  )
+
   target_link_libraries(bitcoin_kernel_gpu PUBLIC
     ${CUDA_LIBRARIES}
     ${CUDA_CUDART_LIBRARY}
   )
+
+  # Optionally link cuFile if available
+  if(CUFILE_LIBRARY)
+    message(STATUS "Found cuFile library: ${CUFILE_LIBRARY}")
+    target_link_libraries(bitcoin_kernel_gpu PUBLIC ${CUFILE_LIBRARY})
+    target_compile_definitions(bitcoin_kernel_gpu PUBLIC HAVE_CUFILE=1)
+  else()
+    message(STATUS "cuFile library not found - GPUDirect Storage will use fallback mode")
+  endif()
 endif()

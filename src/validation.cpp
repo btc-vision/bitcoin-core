@@ -631,39 +631,118 @@ static bool GPUValidateSingleTransaction(
 
         // Determine signature version
         gpu::GPUSigVersion sigversion = gpu::GPU_SIGVERSION_BASE;
+        SigVersion cpu_sigversion = SigVersion::BASE;
 
         // Check for witness program
         if (scriptPubKey.size() == 22 && scriptPubKey[0] == OP_0) {
             sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
+            cpu_sigversion = SigVersion::WITNESS_V0;
         } else if (scriptPubKey.size() == 34 && scriptPubKey[0] == OP_1) {
-            sigversion = gpu::GPU_SIGVERSION_TAPROOT;
+            // P2TR: distinguish key path vs script path
+            const auto& wit = tx.vin[i].scriptWitness.stack;
+            size_t wit_count = wit.size();
+            bool has_annex = (wit_count >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+            size_t effective_count = has_annex ? wit_count - 1 : wit_count;
+
+            if (effective_count == 1) {
+                sigversion = gpu::GPU_SIGVERSION_TAPROOT;
+                cpu_sigversion = SigVersion::TAPROOT;
+            } else {
+                sigversion = gpu::GPU_SIGVERSION_TAPSCRIPT;
+                cpu_sigversion = SigVersion::TAPSCRIPT;
+            }
         }
 
-        // Get witness data
-        const uint8_t* witness_data = nullptr;
-        uint32_t witness_size = 0;
+        // Serialize witness data for GPU
+        std::vector<uint8_t> serialized_witness;
         uint32_t witness_count = 0;
 
         if (tx.HasWitness() && i < tx.vin.size() && !tx.vin[i].scriptWitness.IsNull()) {
             const CScriptWitness& wit = tx.vin[i].scriptWitness;
             witness_count = wit.stack.size();
-            // Serialize witness for GPU
-            // For now, skip complex witness handling - let CPU handle it
-            if (sigversion == gpu::GPU_SIGVERSION_WITNESS_V0 ||
-                sigversion == gpu::GPU_SIGVERSION_TAPROOT) {
-                // Simple witness case - handled by GPU
+            // Serialize witness: for each item, push length byte then data
+            for (const auto& item : wit.stack) {
+                serialized_witness.push_back(static_cast<uint8_t>(item.size()));
+                serialized_witness.insert(serialized_witness.end(), item.begin(), item.end());
             }
+        }
+
+        // Compute sighash for GPU
+        uint256 sighash;
+        const uint8_t* sighash_ptr = nullptr;
+        int nHashType = SIGHASH_ALL;
+
+        if (cpu_sigversion == SigVersion::TAPROOT || cpu_sigversion == SigVersion::TAPSCRIPT) {
+            // Taproot/Tapscript: get sighash type from witness[0]
+            const auto& wit = tx.vin[i].scriptWitness.stack;
+            if (witness_count > 0 && !wit.empty()) {
+                const auto& sig = wit[0];
+                nHashType = (sig.size() == 65) ? sig[64] : 0x00;
+            }
+            ScriptExecutionData execdata;
+            execdata.m_annex_init = true;
+            execdata.m_codeseparator_pos_init = true;
+            execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+
+            bool has_annex = (wit.size() >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+            if (has_annex) {
+                execdata.m_annex_present = true;
+                const auto& annex = wit.back();
+                std::vector<unsigned char> annex_with_size;
+                annex_with_size.push_back(static_cast<unsigned char>(annex.size()));
+                annex_with_size.insert(annex_with_size.end(), annex.begin(), annex.end());
+                CSHA256().Write(annex_with_size.data(), annex_with_size.size()).Finalize(execdata.m_annex_hash.begin());
+            } else {
+                execdata.m_annex_present = false;
+            }
+
+            // For script path, compute tapleaf hash
+            if (cpu_sigversion == SigVersion::TAPSCRIPT) {
+                size_t ctrl_idx = has_annex ? wit.size() - 2 : wit.size() - 1;
+                size_t script_idx = ctrl_idx - 1;
+                if (script_idx < wit.size() && ctrl_idx < wit.size()) {
+                    const auto& tapscript = wit[script_idx];
+                    const auto& control_block = wit[ctrl_idx];
+                    uint8_t leaf_version = control_block.empty() ? 0xc0 : (control_block[0] & 0xfe);
+                    execdata.m_tapleaf_hash_init = true;
+                    execdata.m_tapleaf_hash = ComputeTapleafHash(leaf_version, tapscript);
+                }
+            }
+
+            if (SignatureHashSchnorr(sighash, execdata, tx, i, nHashType, cpu_sigversion, txdata, MissingDataBehavior::FAIL)) {
+                sighash_ptr = sighash.data();
+            }
+        } else if (cpu_sigversion == SigVersion::WITNESS_V0) {
+            // Witness v0: get sighash type from signature
+            if (witness_count > 0 && !tx.vin[i].scriptWitness.stack.empty() && !tx.vin[i].scriptWitness.stack[0].empty()) {
+                nHashType = tx.vin[i].scriptWitness.stack[0].back();
+            }
+            sighash = SignatureHash(scriptPubKey, tx, i, nHashType, spent_output.nValue, SigVersion::WITNESS_V0, &txdata);
+            sighash_ptr = sighash.data();
+        } else {
+            // Legacy
+            if (!scriptSig.empty()) {
+                CScript::const_iterator pc = scriptSig.begin();
+                opcodetype opcode;
+                std::vector<unsigned char> sig;
+                if (scriptSig.GetOp(pc, opcode, sig) && !sig.empty()) {
+                    nHashType = sig.back();
+                }
+            }
+            sighash = SignatureHash(scriptPubKey, tx, i, nHashType, spent_output.nValue, SigVersion::BASE, &txdata);
+            sighash_ptr = sighash.data();
         }
 
         int job_idx = g_gpu_mempool_validator->QueueJob(
             0, i,  // tx_index=0 (single tx), input_index=i
             scriptPubKey.data(), scriptPubKey.size(),
             scriptSig.data(), scriptSig.size(),
-            witness_data, witness_size, witness_count,
+            serialized_witness.data(), serialized_witness.size(), witness_count,
             spent_output.nValue,
             tx.vin[i].nSequence,
             static_cast<uint32_t>(flags.as_int()),  // Convert flags to integer
-            sigversion
+            sigversion,
+            sighash_ptr
         );
 
         if (job_idx < 0) {
@@ -3135,27 +3214,129 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                             sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
                             cpu_sigversion = SigVersion::WITNESS_V0;
                         } else if (stype == gpu::SCRIPT_TYPE_P2TR) {
-                            sigversion = gpu::GPU_SIGVERSION_TAPROOT;
-                            cpu_sigversion = SigVersion::TAPROOT;
+                            // P2TR: distinguish between key path and script path spends
+                            // Key path: witness = [signature] (1 element)
+                            // Script path: witness = [stack..., tapscript, control_block] (2+ elements)
+                            // Note: annex (if present) is last item starting with 0x50
+                            const auto& wit = txin.scriptWitness.stack;
+                            size_t wit_count = wit.size();
+
+                            // Check for annex (last element starts with 0x50)
+                            bool has_annex = (wit_count >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+                            size_t effective_count = has_annex ? wit_count - 1 : wit_count;
+
+                            if (effective_count == 1) {
+                                // Key path spend
+                                sigversion = gpu::GPU_SIGVERSION_TAPROOT;
+                                cpu_sigversion = SigVersion::TAPROOT;
+                            } else {
+                                // Script path spend (2+ elements: stack items + tapscript + control block)
+                                sigversion = gpu::GPU_SIGVERSION_TAPSCRIPT;
+                                cpu_sigversion = SigVersion::TAPSCRIPT;
+                            }
                         } else if (stype == gpu::SCRIPT_TYPE_P2SH && !txin.scriptWitness.IsNull()) {
                             // P2SH-wrapped witness (P2SH-P2WPKH or P2SH-P2WSH)
                             sigversion = gpu::GPU_SIGVERSION_WITNESS_V0;
                             cpu_sigversion = SigVersion::WITNESS_V0;
                         }
 
-                        // Compute sighash (assume SIGHASH_ALL which covers 99%+ of transactions)
-                        // If signature uses different sighash type, GPU will fall back to CPU
+                        // Compute sighash using the actual sighash type from the signature
                         uint256 sighash;
                         const uint8_t* sighash_ptr = nullptr;
-                        if (cpu_sigversion == SigVersion::TAPROOT) {
-                            // BIP341 Taproot sighash (use SIGHASH_DEFAULT = 0x00)
+
+                        // Extract sighash type from signature
+                        // For ECDSA: last byte of DER signature in scriptSig or witness
+                        // For Schnorr: last byte if sig is 65 bytes, else SIGHASH_DEFAULT
+                        int nHashType = SIGHASH_ALL;  // Default
+
+                        if (cpu_sigversion == SigVersion::TAPROOT || cpu_sigversion == SigVersion::TAPSCRIPT) {
+                            // Taproot/Tapscript: signature is in witness[0]
+                            // 64 bytes = SIGHASH_DEFAULT (0x00)
+                            // 65 bytes = last byte is sighash type
+                            const auto& wit = txin.scriptWitness.stack;
+                            if (!txin.scriptWitness.IsNull() && !wit.empty()) {
+                                const auto& sig = wit[0];
+                                if (sig.size() == 65) {
+                                    nHashType = sig[64];
+                                } else {
+                                    nHashType = 0x00;  // SIGHASH_DEFAULT
+                                }
+                            }
                             ScriptExecutionData execdata;
-                            if (SignatureHashSchnorr(sighash, execdata, tx, j, 0x00, cpu_sigversion, txsdata[i], MissingDataBehavior::FAIL)) {
+                            execdata.m_annex_init = true;
+                            execdata.m_codeseparator_pos_init = true;
+                            execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+
+                            // Detect annex: last witness element starts with 0x50 when 2+ elements
+                            bool has_annex = (wit.size() >= 2 && !wit.back().empty() && wit.back()[0] == 0x50);
+                            if (has_annex) {
+                                execdata.m_annex_present = true;
+                                // Compute annex hash: SHA256 of (compact_size(annex.size()) || annex)
+                                const auto& annex = wit.back();
+                                std::vector<unsigned char> annex_with_size;
+                                annex_with_size.reserve(annex.size() + 5);
+                                // Add compact size prefix
+                                if (annex.size() < 253) {
+                                    annex_with_size.push_back(static_cast<unsigned char>(annex.size()));
+                                } else if (annex.size() <= 0xFFFF) {
+                                    annex_with_size.push_back(253);
+                                    annex_with_size.push_back(annex.size() & 0xFF);
+                                    annex_with_size.push_back((annex.size() >> 8) & 0xFF);
+                                }
+                                annex_with_size.insert(annex_with_size.end(), annex.begin(), annex.end());
+                                CSHA256().Write(annex_with_size.data(), annex_with_size.size()).Finalize(execdata.m_annex_hash.begin());
+                            } else {
+                                execdata.m_annex_present = false;
+                            }
+
+                            // For script path spends, compute tapleaf hash
+                            if (cpu_sigversion == SigVersion::TAPSCRIPT) {
+                                // Script path: witness = [stack_items..., tapscript, control_block, (annex)]
+                                // Control block is last (or second-to-last if annex present)
+                                // Tapscript is second-to-last (or third-to-last if annex present)
+                                size_t ctrl_idx = has_annex ? wit.size() - 2 : wit.size() - 1;
+                                size_t script_idx = ctrl_idx - 1;
+
+                                if (script_idx < wit.size() && ctrl_idx < wit.size()) {
+                                    const auto& tapscript = wit[script_idx];
+                                    const auto& control_block = wit[ctrl_idx];
+
+                                    // Extract leaf version from control block (first byte's low 1 bit gives parity, rest is version)
+                                    // Leaf version is (control_block[0] & 0xfe)
+                                    uint8_t leaf_version = control_block.empty() ? 0xc0 : (control_block[0] & 0xfe);
+
+                                    // Compute tapleaf hash = SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version || compact_size(script.size()) || script)
+                                    execdata.m_tapleaf_hash_init = true;
+                                    // Use Bitcoin Core's existing tapleaf hash computation
+                                    execdata.m_tapleaf_hash = ComputeTapleafHash(leaf_version, tapscript);
+                                }
+                            }
+
+                            if (SignatureHashSchnorr(sighash, execdata, tx, j, nHashType, cpu_sigversion, txsdata[i], MissingDataBehavior::FAIL)) {
                                 sighash_ptr = sighash.data();
                             }
+                        } else if (cpu_sigversion == SigVersion::WITNESS_V0) {
+                            // SegWit v0: signature is in witness stack
+                            // For P2WPKH: witness[0] is signature
+                            // For P2WSH: signatures are in witness stack before redeem script
+                            if (!txin.scriptWitness.IsNull() && !txin.scriptWitness.stack.empty()) {
+                                const auto& sig = txin.scriptWitness.stack[0];
+                                if (!sig.empty()) {
+                                    nHashType = sig.back();
+                                }
+                            }
+                            sighash = SignatureHash(coin.out.scriptPubKey, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
+                            sighash_ptr = sighash.data();
                         } else {
-                            // Legacy or BIP143 sighash (SIGHASH_ALL = 0x01)
-                            sighash = SignatureHash(coin.out.scriptPubKey, tx, j, SIGHASH_ALL, coin.out.nValue, cpu_sigversion, &txsdata[i]);
+                            // Legacy: signature is in scriptSig (first push)
+                            // Parse DER signature to get sighash type
+                            CScript::const_iterator pc = txin.scriptSig.begin();
+                            opcodetype opcode;
+                            std::vector<unsigned char> sig;
+                            if (txin.scriptSig.GetOp(pc, opcode, sig) && !sig.empty()) {
+                                nHashType = sig.back();
+                            }
+                            sighash = SignatureHash(coin.out.scriptPubKey, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
                             sighash_ptr = sighash.data();
                         }
 
@@ -3166,6 +3347,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                 // Simple format: length prefix + data
                                 witness_data.push_back(static_cast<uint8_t>(item.size()));
                                 witness_data.insert(witness_data.end(), item.begin(), item.end());
+                            }
+                        }
+
+                        // Debug: log witness data info for P2TR
+                        if (sigversion == gpu::GPU_SIGVERSION_TAPROOT) {
+                            fprintf(stderr, "[GPU DBG] P2TR tx=%d input=%d: witness_null=%d, stack_size=%zu, serialized_size=%zu\n",
+                                    i, j, txin.scriptWitness.IsNull(), txin.scriptWitness.stack.size(), witness_data.size());
+                            if (!txin.scriptWitness.stack.empty()) {
+                                fprintf(stderr, "[GPU DBG] P2TR first witness item size=%zu\n", txin.scriptWitness.stack[0].size());
                             }
                         }
 
@@ -3204,11 +3394,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 }
             }
 
-            // Skip CPU validation if GPU will handle this transaction
+            // Skip CPU script validation if GPU will handle this transaction
+            // BUT we still need to update the UTXO set (UpdateCoins) below!
             if (use_gpu_for_this_tx) {
-                // Will be validated in batch after all transactions are queued
-                continue;
-            }
+                // Don't continue here - we need to run UpdateCoins below
+                // The GPU will validate scripts in batch after all transactions are queued
+                // Fall through to UpdateCoins
+            } else {
 #endif
             
             // If CheckInputScripts is called with a pointer to a checks vector, the resulting checks are appended to it. In that case
@@ -3226,6 +3418,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                               tx_state.GetRejectReason(), tx_state.GetDebugMessage());
                 break;
             }
+#ifdef ENABLE_GPU_ACCELERATION
+            } // Close the else block from use_gpu_for_this_tx check
+#endif
         }
 
         CTxUndo undoDummy;
