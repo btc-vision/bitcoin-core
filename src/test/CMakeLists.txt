@@ -181,8 +181,26 @@ target_link_libraries(test_bitcoin
   secp256k1
   Boost::headers
   libevent::extra
-  $<$<BOOL:${ENABLE_GPU_ACCELERATION}>:bitcoin_kernel_gpu>
 )
+
+# Enable CUDA device linking for test_bitcoin when GPU acceleration is enabled
+if(ENABLE_GPU_ACCELERATION)
+  # Add a minimal .cu file to force CUDA device linking for this executable
+  # This ensures the GPU library's device code is properly linked
+  target_sources(test_bitcoin PRIVATE
+    cuda_device_link.cu
+  )
+
+  set_target_properties(test_bitcoin PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  # Link GPU library
+  target_link_libraries(test_bitcoin
+    bitcoin_kernel_gpu
+    ${CUDA_CUDART_LIBRARY}
+  )
+endif()
 
 if(ENABLE_WALLET)
   add_subdirectory(${PROJECT_SOURCE_DIR}/src/wallet/test wallet)

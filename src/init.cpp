@@ -530,6 +530,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-gpuvalidation", strprintf("Enable GPU script validation when -gpuacceleration is enabled (default: %u)", true), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-gpumempool", strprintf("Enable GPU acceleration for mempool transaction validation (default: %u)", true), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-gpuvram=<n>", strprintf("Maximum GPU VRAM usage in MB for UTXO set (default: %u)", 8192), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-gpulogging", strprintf("Enable GPU timing/performance logging (default: %u)", false), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blockfilterindex=<type>",
                  strprintf("Maintain an index of compact filters by block (default: %s, values: %s).", DEFAULT_BLOCKFILTERINDEX, ListBlockFilterTypes()) +
                  " If <type> is not supplied or if <type> = 1, indexes for all known types are enabled.",

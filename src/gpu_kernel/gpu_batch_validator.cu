@@ -28,6 +28,38 @@
 #define GPU_LOG_INFO(fmt, ...) do {} while(0)
 #endif
 
+// Test kernel to validate generator table on device
+__global__ void TestGeneratorTableKernel(
+    const gpu::secp256k1::GeneratorTable* gen_table,
+    uint8_t* result_gen,
+    uint8_t* result_simple)
+{
+    // Compute 1*G using ecmult_gen
+    gpu::secp256k1::Scalar one;
+    one.SetZero();
+    one.d[0] = 1;
+
+    gpu::secp256k1::JacobianPoint r_gen;
+    gpu::secp256k1::ecmult_gen(r_gen, *gen_table, one);
+
+    // Compute 1*G using ecmult_simple
+    gpu::secp256k1::AffinePoint g_affine;
+    gpu::secp256k1::GetGenerator(g_affine);
+    gpu::secp256k1::JacobianPoint g_jac;
+    g_jac.FromAffine(g_affine);
+    gpu::secp256k1::JacobianPoint r_simple;
+    gpu::secp256k1::ecmult_simple(r_simple, g_jac, one);
+
+    // Get x-coordinates
+    gpu::secp256k1::FieldElement rx_gen, rx_simple;
+    gpu::secp256k1::point_get_x(rx_gen, r_gen);
+    gpu::secp256k1::point_get_x(rx_simple, r_simple);
+
+    // Output as bytes
+    rx_gen.GetBytes(result_gen);
+    rx_simple.GetBytes(result_simple);
+}
+
 namespace gpu {
 
 // Device-only version of IdentifyScriptType for kernel use
@@ -108,6 +140,7 @@ __device__ inline ScriptType IdentifyScriptTypeDevice(const uint8_t* script, uin
 GPUBatchValidator::GPUBatchValidator()
     : m_initialized(false)
     , m_batch_active(false)
+    , m_logging(false)
     , m_job_count(0)
     , m_max_jobs(0)
     , m_scriptpubkey_used(0)
@@ -120,7 +153,9 @@ GPUBatchValidator::GPUBatchValidator()
     , d_scriptpubkey_blob(nullptr)
     , d_scriptsig_blob(nullptr)
     , d_witness_blob(nullptr)
+    , m_stream(nullptr)
     , d_contexts(nullptr)
+    , d_gen_table(nullptr)
     , d_tx_contexts(nullptr)
     , m_utxo_set(nullptr)
 {
@@ -144,6 +179,51 @@ bool GPUBatchValidator::Initialize(size_t max_jobs, size_t script_blob_size, siz
         GPU_LOG_ERROR("No CUDA devices available for batch validation");
         return false;
     }
+
+    // Check compute capability (SM version)
+    cudaDeviceProp props;
+    err = cudaGetDeviceProperties(&props, 0);
+    if (err != cudaSuccess) {
+        if (m_logging) fprintf(stderr, "[GPU] ERROR: Failed to query GPU device properties\n");
+        return false;
+    }
+
+    int sm_version = props.major * 10 + props.minor;
+
+    // List of supported SM versions (must match CMAKE_CUDA_ARCHITECTURES)
+    // SM 75 = Turing (2080 Ti, etc.)
+    // SM 80 = Ampere (A100, etc.)
+    // SM 86 = Ampere (3090, etc.)
+    // SM 89 = Ada Lovelace (4090, etc.)
+    // SM 90 = Hopper (H100, etc.)
+    const int supported_sm[] = {75, 80, 86, 87, 89, 90};
+    const int num_supported = sizeof(supported_sm) / sizeof(supported_sm[0]);
+
+    bool sm_supported = false;
+    for (int i = 0; i < num_supported; i++) {
+        if (sm_version == supported_sm[i]) {
+            sm_supported = true;
+            break;
+        }
+    }
+
+    if (!sm_supported) {
+        if (m_logging) {
+            fprintf(stderr, "[GPU] ERROR: Unsupported GPU compute capability SM %d.%d (device: %s)\n",
+                    props.major, props.minor, props.name);
+            fprintf(stderr, "[GPU] Supported SM versions: ");
+            for (int i = 0; i < num_supported; i++) {
+                fprintf(stderr, "%d.%d%s", supported_sm[i] / 10, supported_sm[i] % 10,
+                        i < num_supported - 1 ? ", " : "\n");
+            }
+            fprintf(stderr, "[GPU] Please rebuild with -DCMAKE_CUDA_ARCHITECTURES=\"%d\" or upgrade your GPU.\n",
+                    sm_version);
+        }
+        return false;
+    }
+
+    if (m_logging) fprintf(stderr, "[GPU] Detected GPU: %s (SM %d.%d, %zu MB VRAM)\n",
+            props.name, props.major, props.minor, props.totalGlobalMem / (1024 * 1024));
 
     // Query available GPU memory to dynamically size max_jobs
     size_t free_mem = 0, total_mem = 0;
@@ -207,6 +287,15 @@ bool GPUBatchValidator::Initialize(size_t max_jobs, size_t script_blob_size, siz
         return false;
     }
 
+    // Create CUDA stream for async execution
+    cudaStream_t stream;
+    if (cudaStreamCreate(&stream) != cudaSuccess) {
+        GPU_LOG_ERROR("Failed to create CUDA stream");
+        FreeDeviceMemory();
+        return false;
+    }
+    m_stream = static_cast<void*>(stream);
+
     m_initialized = true;
     GPU_LOG_INFO("GPU Batch Validator initialized: max_jobs=%zu, script_blob=%zuMB, witness_blob=%zuMB",
                  max_jobs, script_blob_size / (1024 * 1024), witness_blob_size / (1024 * 1024));
@@ -217,6 +306,12 @@ bool GPUBatchValidator::Initialize(size_t max_jobs, size_t script_blob_size, siz
 void GPUBatchValidator::Shutdown()
 {
     if (!m_initialized) return;
+
+    // Destroy CUDA stream
+    if (m_stream) {
+        cudaStreamDestroy(static_cast<cudaStream_t>(m_stream));
+        m_stream = nullptr;
+    }
 
     FreeDeviceMemory();
 
@@ -273,11 +368,182 @@ bool GPUBatchValidator::AllocateDeviceMemory()
     }
 
     // Allocate script execution contexts (spilled to global memory for large stack support)
-    err = cudaMalloc(&d_contexts, m_max_jobs * sizeof(GPUScriptContext));
+    size_t context_bytes = m_max_jobs * sizeof(GPUScriptContext);
+    if (m_logging) fprintf(stderr, "[GPU] Allocating %zu MB for %zu script contexts...\n",
+            context_bytes / (1024 * 1024), m_max_jobs);
+    err = cudaMalloc(&d_contexts, context_bytes);
     if (err != cudaSuccess) {
         GPU_LOG_ERROR("cudaMalloc failed for script contexts: %s", cudaGetErrorString(err));
         FreeDeviceMemory();
         return false;
+    }
+    if (m_logging) fprintf(stderr, "[GPU] Successfully allocated script contexts\n");
+
+    // Allocate and initialize precomputed generator table for fast k*G
+    secp256k1::GeneratorTable* gen_table_ptr;
+    err = cudaMalloc(&gen_table_ptr, sizeof(secp256k1::GeneratorTable));
+    if (err != cudaSuccess) {
+        GPU_LOG_ERROR("cudaMalloc failed for generator table: %s", cudaGetErrorString(err));
+        FreeDeviceMemory();
+        return false;
+    }
+    d_gen_table = gen_table_ptr;
+
+    // Initialize table on host and copy to device
+    secp256k1::GeneratorTable host_table;
+    host_table.Init();
+
+    // Validate generator table by testing 1*G
+    if (m_logging) {
+        fprintf(stderr, "[GPU] === GENERATOR TABLE VALIDATION START ===\n");
+        fflush(stderr);
+        {
+            secp256k1::Scalar one;
+            one.SetZero();
+            one.d[0] = 1;  // k = 1
+
+            secp256k1::JacobianPoint r_gen, r_simple;
+            secp256k1::ecmult_gen(r_gen, host_table, one);
+
+            // Also compute using simple multiplication
+            secp256k1::AffinePoint g_affine;
+            secp256k1::GetGenerator(g_affine);
+            secp256k1::JacobianPoint g_jac;
+            g_jac.FromAffine(g_affine);
+            secp256k1::ecmult_simple(r_simple, g_jac, one);
+
+            // Convert both to affine and compare
+            secp256k1::FieldElement rx_gen, ry_gen, rx_simple, ry_simple;
+            secp256k1::point_get_x(rx_gen, r_gen);
+            secp256k1::point_get_x(rx_simple, r_simple);
+
+            uint8_t bytes_gen[32], bytes_simple[32];
+            rx_gen.GetBytes(bytes_gen);
+            rx_simple.GetBytes(bytes_simple);
+
+            bool match = true;
+            for (int i = 0; i < 32; i++) {
+                if (bytes_gen[i] != bytes_simple[i]) {
+                    match = false;
+                    break;
+                }
+            }
+
+            fprintf(stderr, "[GPU] ecmult_gen(1*G).x  = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bytes_gen[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[GPU] ecmult_simple(1*G).x = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bytes_simple[i]);
+            fprintf(stderr, "\n");
+
+            if (!match) {
+                fprintf(stderr, "[GPU] ERROR: Generator table validation FAILED for 1*G!\n");
+            } else {
+                fprintf(stderr, "[GPU] OK: 1*G matches\n");
+            }
+
+            // Also test with k = 2 (window value = 2)
+            secp256k1::Scalar two;
+            two.SetZero();
+            two.d[0] = 2;
+            secp256k1::ecmult_gen(r_gen, host_table, two);
+            secp256k1::ecmult_simple(r_simple, g_jac, two);
+            secp256k1::point_get_x(rx_gen, r_gen);
+            secp256k1::point_get_x(rx_simple, r_simple);
+            rx_gen.GetBytes(bytes_gen);
+            rx_simple.GetBytes(bytes_simple);
+
+            match = true;
+            for (int i = 0; i < 32; i++) {
+                if (bytes_gen[i] != bytes_simple[i]) { match = false; break; }
+            }
+            fprintf(stderr, "[GPU] ecmult_gen(2*G).x  = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bytes_gen[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[GPU] ecmult_simple(2*G).x = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bytes_simple[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[GPU] %s: 2*G\n", match ? "OK" : "ERROR");
+
+            // Also test with k = 16 (first bit of second window)
+            secp256k1::Scalar sixteen;
+            sixteen.SetZero();
+            sixteen.d[0] = 16;
+            secp256k1::ecmult_gen(r_gen, host_table, sixteen);
+            secp256k1::ecmult_simple(r_simple, g_jac, sixteen);
+            secp256k1::point_get_x(rx_gen, r_gen);
+            secp256k1::point_get_x(rx_simple, r_simple);
+            rx_gen.GetBytes(bytes_gen);
+            rx_simple.GetBytes(bytes_simple);
+
+            match = true;
+            for (int i = 0; i < 32; i++) {
+                if (bytes_gen[i] != bytes_simple[i]) { match = false; break; }
+            }
+            fprintf(stderr, "[GPU] ecmult_gen(16*G).x  = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bytes_gen[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[GPU] ecmult_simple(16*G).x = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bytes_simple[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[GPU] %s: 16*G\n", match ? "OK" : "ERROR");
+
+            fflush(stderr);
+        }
+        fprintf(stderr, "[GPU] === GENERATOR TABLE VALIDATION END ===\n");
+    }
+    fflush(stderr);
+
+    err = cudaMemcpy(gen_table_ptr, &host_table, sizeof(secp256k1::GeneratorTable), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        GPU_LOG_ERROR("cudaMemcpy failed for generator table: %s", cudaGetErrorString(err));
+        FreeDeviceMemory();
+        return false;
+    }
+
+    // GPU-SIDE validation: test ecmult_gen on device
+    if (m_logging) {
+        fprintf(stderr, "[GPU] === DEVICE-SIDE VALIDATION START ===\n");
+        fflush(stderr);
+        {
+            // Allocate result buffers on device
+            uint8_t* d_result_gen;
+            uint8_t* d_result_simple;
+            cudaMalloc(&d_result_gen, 32);
+            cudaMalloc(&d_result_simple, 32);
+
+            // Launch a simple test kernel with 1 thread
+            TestGeneratorTableKernel<<<1, 1>>>(gen_table_ptr, d_result_gen, d_result_simple);
+            cudaDeviceSynchronize();
+
+            // Copy results back
+            uint8_t h_result_gen[32], h_result_simple[32];
+            cudaMemcpy(h_result_gen, d_result_gen, 32, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_result_simple, d_result_simple, 32, cudaMemcpyDeviceToHost);
+
+            // Compare
+            fprintf(stderr, "[GPU] Device ecmult_gen(1*G).x  = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", h_result_gen[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[GPU] Device ecmult_simple(1*G).x = ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", h_result_simple[i]);
+            fprintf(stderr, "\n");
+
+            bool device_match = true;
+            for (int i = 0; i < 32; i++) {
+                if (h_result_gen[i] != h_result_simple[i]) {
+                    device_match = false;
+                    break;
+                }
+            }
+            fprintf(stderr, "[GPU] Device validation: %s\n", device_match ? "OK" : "FAILED");
+            fflush(stderr);
+
+            cudaFree(d_result_gen);
+            cudaFree(d_result_simple);
+        }
+        fprintf(stderr, "[GPU] === DEVICE-SIDE VALIDATION END ===\n");
+        fflush(stderr);
     }
 
     return true;
@@ -291,6 +557,7 @@ void GPUBatchValidator::FreeDeviceMemory()
     if (d_witness_blob) { cudaFree(d_witness_blob); d_witness_blob = nullptr; }
     if (d_contexts) { cudaFree(d_contexts); d_contexts = nullptr; }
     if (d_tx_contexts) { cudaFree(d_tx_contexts); d_tx_contexts = nullptr; }
+    if (d_gen_table) { cudaFree(d_gen_table); d_gen_table = nullptr; }
 }
 
 void GPUBatchValidator::BeginBatch()
@@ -325,25 +592,29 @@ int GPUBatchValidator::QueueJob(
     const uint8_t* sighash)
 {
     if (!m_initialized || !m_batch_active) {
+        if (m_logging) {
+            static int debug_count = 0;
+            if (debug_count++ < 5) {
+                fprintf(stderr, "[GPU DEBUG] QueueJob rejected: m_initialized=%d, m_batch_active=%d (this=%p)\n",
+                        m_initialized, m_batch_active, (void*)this);
+                fflush(stderr);
+            }
+        }
         return -1;
     }
 
     if (m_job_count >= m_max_jobs) {
-        GPU_LOG_WARNING("Batch validator job queue full");
-        return -1;
+        return -1;  // Queue full, caller should flush
     }
 
     // Check space in script blobs
     if (m_scriptpubkey_used + scriptpubkey_len > m_scriptpubkey_max) {
-        GPU_LOG_WARNING("ScriptPubKey blob full");
         return -1;
     }
     if (m_scriptsig_used + scriptsig_len > m_scriptsig_max) {
-        GPU_LOG_WARNING("ScriptSig blob full");
         return -1;
     }
     if (m_witness_used + witness_len > m_witness_max) {
-        GPU_LOG_WARNING("Witness blob full");
         return -1;
     }
 
@@ -441,17 +712,18 @@ GPUSigVersion GPUBatchValidator::DetermineSigVersion(
 bool GPUBatchValidator::CopyToDevice()
 {
     cudaError_t err;
+    cudaStream_t stream = static_cast<cudaStream_t>(m_stream);
 
-    // Copy jobs
-    err = cudaMemcpy(d_jobs, m_jobs.data(), m_job_count * sizeof(ScriptValidationJob), cudaMemcpyHostToDevice);
+    // Copy jobs (async)
+    err = cudaMemcpyAsync(d_jobs, m_jobs.data(), m_job_count * sizeof(ScriptValidationJob), cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) {
         GPU_LOG_ERROR("cudaMemcpy failed for jobs: %s", cudaGetErrorString(err));
         return false;
     }
 
-    // Copy script blobs
+    // Copy script blobs (async)
     if (m_scriptpubkey_used > 0) {
-        err = cudaMemcpy(d_scriptpubkey_blob, m_scriptpubkey_blob.data(), m_scriptpubkey_used, cudaMemcpyHostToDevice);
+        err = cudaMemcpyAsync(d_scriptpubkey_blob, m_scriptpubkey_blob.data(), m_scriptpubkey_used, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
             GPU_LOG_ERROR("cudaMemcpy failed for scriptpubkey blob: %s", cudaGetErrorString(err));
             return false;
@@ -459,7 +731,7 @@ bool GPUBatchValidator::CopyToDevice()
     }
 
     if (m_scriptsig_used > 0) {
-        err = cudaMemcpy(d_scriptsig_blob, m_scriptsig_blob.data(), m_scriptsig_used, cudaMemcpyHostToDevice);
+        err = cudaMemcpyAsync(d_scriptsig_blob, m_scriptsig_blob.data(), m_scriptsig_used, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
             GPU_LOG_ERROR("cudaMemcpy failed for scriptsig blob: %s", cudaGetErrorString(err));
             return false;
@@ -467,7 +739,7 @@ bool GPUBatchValidator::CopyToDevice()
     }
 
     if (m_witness_used > 0) {
-        err = cudaMemcpy(d_witness_blob, m_witness_blob.data(), m_witness_used, cudaMemcpyHostToDevice);
+        err = cudaMemcpyAsync(d_witness_blob, m_witness_blob.data(), m_witness_used, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
             GPU_LOG_ERROR("cudaMemcpy failed for witness blob: %s", cudaGetErrorString(err));
             return false;
@@ -479,7 +751,8 @@ bool GPUBatchValidator::CopyToDevice()
 
 bool GPUBatchValidator::CopyFromDevice()
 {
-    cudaError_t err = cudaMemcpy(m_jobs.data(), d_jobs, m_job_count * sizeof(ScriptValidationJob), cudaMemcpyDeviceToHost);
+    cudaStream_t stream = static_cast<cudaStream_t>(m_stream);
+    cudaError_t err = cudaMemcpyAsync(m_jobs.data(), d_jobs, m_job_count * sizeof(ScriptValidationJob), cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         GPU_LOG_ERROR("cudaMemcpy failed for results: %s", cudaGetErrorString(err));
         return false;
@@ -496,68 +769,101 @@ BatchValidationResult GPUBatchValidator::ValidateBatch()
         return result;
     }
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+    // Detailed timing instrumentation
+    auto t0 = std::chrono::high_resolution_clock::now();
 
-    // Copy data to device
-    if (!CopyToDevice()) {
-        GPU_LOG_ERROR("Failed to copy batch data to device");
-        result.skipped_count = m_job_count;
-        return result;
+    cudaStream_t stream = static_cast<cudaStream_t>(m_stream);
+    cudaError_t err;
+
+    // Time each copy operation separately
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    // Copy jobs
+    err = cudaMemcpyAsync(d_jobs, m_jobs.data(), m_job_count * sizeof(ScriptValidationJob), cudaMemcpyHostToDevice, stream);
+    cudaStreamSynchronize(stream);
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    // Copy scriptpubkey blob
+    if (m_scriptpubkey_used > 0) {
+        err = cudaMemcpyAsync(d_scriptpubkey_blob, m_scriptpubkey_blob.data(), m_scriptpubkey_used, cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
     }
+    auto t3 = std::chrono::high_resolution_clock::now();
 
-    auto copy_done = std::chrono::high_resolution_clock::now();
-    result.setup_time_ms = std::chrono::duration<double, std::milli>(copy_done - start_time).count();
+    // Copy scriptsig blob
+    if (m_scriptsig_used > 0) {
+        err = cudaMemcpyAsync(d_scriptsig_blob, m_scriptsig_blob.data(), m_scriptsig_used, cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
+    }
+    auto t4 = std::chrono::high_resolution_clock::now();
+
+    // Copy witness blob
+    if (m_witness_used > 0) {
+        err = cudaMemcpyAsync(d_witness_blob, m_witness_blob.data(), m_witness_used, cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
+    }
+    auto t5 = std::chrono::high_resolution_clock::now();
 
     // Calculate grid dimensions
     int threads_per_block = 256;
     int num_blocks = (m_job_count + threads_per_block - 1) / threads_per_block;
 
-    GPU_LOG_INFO("Kernel launch: blocks=%d, threads=%d, jobs=%zu, d_jobs=%p",
-                 num_blocks, threads_per_block, m_job_count, (void*)d_jobs);
-
-    // Launch validation kernel
-    BatchValidateScriptsKernel<<<num_blocks, threads_per_block>>>(
+    // Launch validation kernel on stream
+    auto t6 = std::chrono::high_resolution_clock::now();
+    BatchValidateScriptsKernel<<<num_blocks, threads_per_block, 0, stream>>>(
         d_jobs,
         d_scriptpubkey_blob,
         d_scriptsig_blob,
         d_witness_blob,
         d_contexts,
+        static_cast<const secp256k1::GeneratorTable*>(d_gen_table),
         m_job_count
     );
 
     // Check for launch errors
     cudaError_t launch_err = cudaGetLastError();
+    auto t7 = std::chrono::high_resolution_clock::now();
+
     if (launch_err != cudaSuccess) {
         GPU_LOG_ERROR("Kernel launch failed: %s", cudaGetErrorString(launch_err));
         result.skipped_count = m_job_count;
         return result;
     }
 
-    // Wait for completion
-    cudaError_t err = cudaDeviceSynchronize();
+    // Wait for stream completion (only blocks this stream, not entire device)
+    err = cudaStreamSynchronize(stream);
+    auto t8 = std::chrono::high_resolution_clock::now();
+
     if (err != cudaSuccess) {
         GPU_LOG_ERROR("Kernel execution failed: %s", cudaGetErrorString(err));
         result.skipped_count = m_job_count;
         return result;
     }
 
-    auto kernel_done = std::chrono::high_resolution_clock::now();
-    result.gpu_time_ms = std::chrono::duration<double, std::milli>(kernel_done - copy_done).count();
-
     // Copy results back
-    if (!CopyFromDevice()) {
-        GPU_LOG_ERROR("Failed to copy results from device");
-        result.skipped_count = m_job_count;
-        return result;
-    }
+    err = cudaMemcpyAsync(m_jobs.data(), d_jobs, m_job_count * sizeof(ScriptValidationJob), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    auto t9 = std::chrono::high_resolution_clock::now();
 
-    // Debug: Print first job's result details
-    if (m_job_count > 0) {
-        const ScriptValidationJob& first_job = m_jobs[0];
-        GPU_LOG_INFO("Job 0 debug: validated=%d, valid=%d, error=%d, sigversion=%d",
-                     (int)first_job.validated, (int)first_job.valid,
-                     (int)first_job.error, (int)first_job.sigversion);
-    }
+    // Print detailed timing breakdown
+    double jobs_copy_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    double spk_copy_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    double sig_copy_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
+    double wit_copy_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
+    double launch_ms = std::chrono::duration<double, std::milli>(t7 - t6).count();
+    double kernel_ms = std::chrono::duration<double, std::milli>(t8 - t7).count();
+    double results_ms = std::chrono::duration<double, std::milli>(t9 - t8).count();
+    double total_ms = std::chrono::duration<double, std::milli>(t9 - t0).count();
+
+    // Always show timing info so user can see GPU performance
+    fprintf(stderr, "[GPU TIMING] jobs=%zu | copy: jobs=%.2fms spk=%.2fms sig=%.2fms wit=%.2fms | launch=%.2fms kernel=%.2fms | results=%.2fms | TOTAL=%.2fms\n",
+            m_job_count, jobs_copy_ms, spk_copy_ms, sig_copy_ms, wit_copy_ms, launch_ms, kernel_ms, results_ms, total_ms);
+    fflush(stderr);
+
+    result.setup_time_ms = jobs_copy_ms + spk_copy_ms + sig_copy_ms + wit_copy_ms;
+    result.gpu_time_ms = kernel_ms;
+
+    // Results already copied back in timing section above
 
     // Analyze results
     for (size_t i = 0; i < m_job_count; i++) {
@@ -586,9 +892,11 @@ BatchValidationResult GPUBatchValidator::ValidateBatch()
         }
     }
 
-    GPU_LOG_INFO("Batch validation complete: %u valid, %u invalid, %u skipped (GPU: %.2fms, setup: %.2fms)",
-                 result.valid_count, result.invalid_count, result.skipped_count,
-                 result.gpu_time_ms, result.setup_time_ms);
+    // Always show batch results so user can see GPU performance
+    fprintf(stderr, "[GPU] Batch validation: %u valid, %u invalid, %u skipped (GPU: %.2fms, setup: %.2fms)\n",
+             result.valid_count, result.invalid_count, result.skipped_count,
+             result.gpu_time_ms, result.setup_time_ms);
+    fflush(stderr);
 
     return result;
 }
@@ -666,7 +974,8 @@ __device__ inline bool ValidateSimpleScript(
     const uint8_t* scriptpubkey,
     const uint8_t* scriptsig,
     const uint8_t* witness,
-    ScriptType script_type)
+    ScriptType script_type,
+    const secp256k1::GeneratorTable* gen_table)
 {
     // Use small local context - fits in local memory with L1/L2 caching
     GPUScriptContextSmall ctx;
@@ -733,6 +1042,11 @@ __device__ inline bool ValidateSimpleScript(
 
             // Check if sighash is precomputed
             if (!job.sighash_valid) {
+                // Debug: print first few cases
+                if (job.input_index < 3) {
+                    printf("[GPU DEBUG] P2WPKH job %u:%u sighash_valid=false, falling back to interpreter\n",
+                           job.tx_index, job.input_index);
+                }
                 // Cannot verify without sighash - fall back to full interpreter
                 return false;
             }
@@ -752,11 +1066,12 @@ __device__ inline bool ValidateSimpleScript(
                 }
             }
 
-            // ECDSA signature verification
-            bool sig_valid = secp256k1::ecdsa_verify(
+            // ECDSA signature verification using precomputed generator table (FAST)
+            bool sig_valid = secp256k1::ecdsa_verify_fast(
                 sig, actual_sig_len,
                 job.sighash.data,
-                pubkey, pubkey_len
+                pubkey, pubkey_len,
+                *gen_table
             );
 
             if (!sig_valid) {
@@ -864,12 +1179,13 @@ __device__ inline bool ValidateSimpleScript(
                 // Get x-only pubkey from scriptPubKey (bytes 2-33)
                 const uint8_t* pubkey = scriptpubkey + 2;
 
-                // Schnorr signature verification (BIP340)
-                bool sig_valid = secp256k1::schnorr_verify(
+                // Schnorr signature verification (BIP340) using precomputed generator table (FAST)
+                bool sig_valid = secp256k1::schnorr_verify_fast(
                     sig,
                     job.sighash.data,
                     32,
-                    pubkey
+                    pubkey,
+                    *gen_table
                 );
 
                 if (!sig_valid) {
@@ -960,11 +1276,12 @@ __device__ inline bool ValidateSimpleScript(
                 }
             }
 
-            // ECDSA signature verification
-            bool sig_valid = secp256k1::ecdsa_verify(
+            // ECDSA signature verification using precomputed generator table (FAST)
+            bool sig_valid = secp256k1::ecdsa_verify_fast(
                 sig, actual_sig_len,
                 job.sighash.data,
-                pubkey, pubkey_len
+                pubkey, pubkey_len,
+                *gen_table
             );
 
             if (!sig_valid) {
@@ -1031,11 +1348,12 @@ __device__ inline bool ValidateSimpleScript(
                 }
             }
 
-            // ECDSA signature verification
-            bool sig_valid = secp256k1::ecdsa_verify(
+            // ECDSA signature verification using precomputed generator table (FAST)
+            bool sig_valid = secp256k1::ecdsa_verify_fast(
                 sig, actual_sig_len,
                 job.sighash.data,
-                pubkey, pubkey_len
+                pubkey, pubkey_len,
+                *gen_table
             );
 
             if (!sig_valid) {
@@ -1143,11 +1461,12 @@ __device__ inline bool ValidateSimpleScript(
                     }
                 }
 
-                // ECDSA verification
-                bool sig_valid = secp256k1::ecdsa_verify(
+                // ECDSA verification (using precomputed generator table)
+                bool sig_valid = secp256k1::ecdsa_verify_fast(
                     sig, actual_sig_len,
                     job.sighash.data,
-                    pubkey, pubkey_len
+                    pubkey, pubkey_len,
+                    *gen_table
                 );
 
                 if (!sig_valid) {
@@ -1201,6 +1520,7 @@ __global__ void BatchValidateScriptsKernel(
     const uint8_t* scriptsig_blob,
     const uint8_t* witness_blob,
     GPUScriptContext* contexts,
+    const secp256k1::GeneratorTable* gen_table,
     uint32_t job_count)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1218,7 +1538,7 @@ __global__ void BatchValidateScriptsKernel(
     ScriptType script_type = IdentifyScriptTypeDevice(scriptpubkey, job.scriptpubkey_size);
 
     // Try fast-path with local memory first
-    if (ValidateSimpleScript(job, scriptpubkey, scriptsig, witness, script_type)) {
+    if (ValidateSimpleScript(job, scriptpubkey, scriptsig, witness, script_type, gen_table)) {
         return;  // Handled by fast path
     }
 
@@ -1245,6 +1565,12 @@ __global__ void BatchValidateScriptsKernel(
     if (job.sighash_valid) {
         for (int i = 0; i < 32; i++) {
             ctx.precomputed_sighash.data[i] = job.sighash.data[i];
+        }
+    } else {
+        // Debug: print when falling back to interpreter with no sighash
+        if (job.input_index < 3) {
+            printf("[GPU DEBUG] ProcessJob %u:%u sighash_valid=false (script_type=%d)\n",
+                   job.tx_index, job.input_index, (int)script_type);
         }
     }
 
@@ -1620,19 +1946,16 @@ __global__ void BatchValidateScriptsKernel(
                     }
                 }
 
-                // Check if sighash was precomputed by caller
-                // If not, we need the transaction data to compute it
+                // Sighash MUST be precomputed by caller
+                // If not, this is a bug in the batch validator setup
                 if (!job.sighash_valid) {
-                    // Sighash must be precomputed by the caller for Taproot
-                    // This requires full transaction context which should be
-                    // passed via validation.cpp before batch execution
                     job.error = GPU_SCRIPT_ERR_UNKNOWN_ERROR;
                     job.valid = false;
                     return;
                 }
 
-                // Verify Schnorr signature against precomputed sighash
-                success = secp256k1::schnorr_verify(sig, job.sighash.data, 32, pubkey);
+                // Verify Schnorr signature against precomputed sighash (FAST path with generator table)
+                success = secp256k1::schnorr_verify_fast(sig, job.sighash.data, 32, pubkey, *gen_table);
                 if (!success) {
                     job.error = GPU_SCRIPT_ERR_SCHNORR_SIG;
                 }

@@ -8,6 +8,7 @@
 #include "gpu_types.h"
 #include "gpu_utxo.h"
 #include "gpu_script_types.cuh"
+#include "gpu_secp256k1_ecmult.cuh"
 
 #include <cstdint>
 #include <vector>
@@ -90,15 +91,17 @@ class GPUBatchValidator {
 public:
     // Configuration
     // NOTE: GPUScriptContext is ~1.05MB each (2x stack of 1000 * 524 bytes)
-    // With typical 2-8GB available for batch validator after UTXO set allocation,
-    // we dynamically calculate max_jobs based on available memory.
-    // 2000 jobs = ~2.1GB which is the default target.
-    // Blocks have ~2000-4000 inputs, so larger batches reduce kernel launches.
-    static constexpr size_t DEFAULT_MAX_JOBS = 2000;   // ~2.1GB VRAM for contexts
+    // With GPU UTXO disabled (-gpuutxo=0 default), all VRAM is available for batch validator.
+    // Dynamically calculate max_jobs based on available GPU memory.
+    // Large blocks can have 10,000+ inputs, so we want to handle them in a single batch.
+    // 8000 jobs = ~8.4GB VRAM for contexts (fits in 12GB+ GPUs like 3080/3090/4080/4090)
+    static constexpr size_t DEFAULT_MAX_JOBS = 8000;   // ~8.4GB VRAM for contexts
     static constexpr size_t MIN_MAX_JOBS = 100;        // Minimum useful batch size
     static constexpr size_t CONTEXT_SIZE_BYTES = 1100000;  // ~1.05MB per GPUScriptContext
-    static constexpr size_t DEFAULT_SCRIPT_BLOB_SIZE = 16 * 1024 * 1024;  // 16MB
-    static constexpr size_t DEFAULT_WITNESS_BLOB_SIZE = 32 * 1024 * 1024; // 32MB
+    // Script/witness blobs are TOTAL for entire batch (not per-tx)
+    // With 10k jobs: 256MB scripts = 12.8KB/tx avg, 512MB witness = 51KB/tx avg
+    static constexpr size_t DEFAULT_SCRIPT_BLOB_SIZE = 256 * 1024 * 1024;  // 256MB total
+    static constexpr size_t DEFAULT_WITNESS_BLOB_SIZE = 512 * 1024 * 1024; // 512MB total
 
     GPUBatchValidator();
     ~GPUBatchValidator();
@@ -109,6 +112,10 @@ public:
                    size_t witness_blob_size = DEFAULT_WITNESS_BLOB_SIZE);
     bool IsInitialized() const { return m_initialized; }
     void Shutdown();
+
+    // Logging control
+    void SetLogging(bool enabled) { m_logging = enabled; }
+    bool GetLogging() const { return m_logging; }
 
     // Batch preparation
     void BeginBatch();
@@ -158,6 +165,7 @@ private:
     // Initialization state
     bool m_initialized;
     bool m_batch_active;
+    bool m_logging;
 
     // Job storage (host-side staging)
     std::vector<ScriptValidationJob> m_jobs;
@@ -180,7 +188,13 @@ private:
     uint8_t* d_scriptpubkey_blob;
     uint8_t* d_scriptsig_blob;
     uint8_t* d_witness_blob;
+
+    // CUDA stream for async execution
+    void* m_stream;  // cudaStream_t
     GPUScriptContext* d_contexts;  // Pre-allocated execution contexts (spilled to global memory)
+
+    // Precomputed generator table for fast k*G operations
+    void* d_gen_table;  // Device pointer to GeneratorTable (~100KB)
 
     // Transaction data for sighash computation
     struct TxContext {
@@ -227,6 +241,7 @@ __global__ void BatchValidateScriptsKernel(
     const uint8_t* scriptsig_blob,
     const uint8_t* witness_blob,
     GPUScriptContext* contexts,
+    const secp256k1::GeneratorTable* gen_table,
     uint32_t job_count
 );
 

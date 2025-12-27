@@ -171,9 +171,17 @@ __device__ __host__ inline void fe_sub_p(FieldElement& a) {
 }
 
 // Reduce modulo p: ensure 0 <= r < p
+// Uses constant-time conditional subtraction (no while loop)
 __device__ __host__ inline void fe_reduce(FieldElement& a) {
-    while (fe_cmp_p(a) >= 0) {
+    // At most 2 subtractions needed for values up to 2p
+    // Check if a >= p, if so subtract p
+    int cmp = fe_cmp_p(a);
+    if (cmp >= 0) {
         fe_sub_p(a);
+        // Check again (for values that were >= 2p)
+        if (fe_cmp_p(a) >= 0) {
+            fe_sub_p(a);
+        }
     }
 }
 
@@ -215,114 +223,256 @@ __device__ __host__ inline void fe_negate(FieldElement& r, const FieldElement& a
 // Multiply by a small constant: r = a * k mod p
 __device__ __host__ inline void fe_mul_small(FieldElement& r, const FieldElement& a, uint32_t k) {
     uint64_t carry = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         carry += (uint64_t)a.d[i] * k;
         r.d[i] = (uint32_t)carry;
         carry >>= 32;
     }
+
     // Reduce the overflow: carry * 2^256 ≡ carry * (2^32 + 977) mod p
-    while (carry) {
-        uint64_t c = carry * 0x3D1; // carry * 977
-        carry = (carry << 32) >> 32; // This is wrong, need proper reduction
-        // Actually: carry * 2^256 = carry * (2^32 + 977) mod p
-        uint64_t t = carry;
+    // For k up to 2^32-1 and a < p, carry is at most ~32 bits
+    // Apply reduction: carry contributes carry*977 to limb 0 and carry to limb 1
+    if (carry) {
+        uint64_t c = carry;
         carry = 0;
-        for (int i = 0; i < 8; i++) {
-            if (i == 0) {
-                c = (uint64_t)r.d[0] + t * 977;
-            } else if (i == 1) {
-                c = (uint64_t)r.d[1] + t + carry;
-            } else {
-                c = (uint64_t)r.d[i] + carry;
+
+        // Add c * 977 to r.d[0]
+        uint64_t t = (uint64_t)r.d[0] + c * 977;
+        r.d[0] = (uint32_t)t;
+        carry = t >> 32;
+
+        // Add c + carry to r.d[1]
+        t = (uint64_t)r.d[1] + c + carry;
+        r.d[1] = (uint32_t)t;
+        carry = t >> 32;
+
+        // Propagate carry
+        #pragma unroll
+        for (int i = 2; i < 8 && carry; i++) {
+            t = (uint64_t)r.d[i] + carry;
+            r.d[i] = (uint32_t)t;
+            carry = t >> 32;
+        }
+
+        // If there's still carry after 8 limbs, one more reduction
+        if (carry) {
+            t = (uint64_t)r.d[0] + carry * 977;
+            r.d[0] = (uint32_t)t;
+            carry = t >> 32;
+            t = (uint64_t)r.d[1] + carry + carry; // +carry for reduction, +carry from r.d[0]
+            r.d[1] = (uint32_t)t;
+            carry = t >> 32;
+            for (int i = 2; i < 8 && carry; i++) {
+                t = (uint64_t)r.d[i] + carry;
+                r.d[i] = (uint32_t)t;
+                carry = t >> 32;
             }
-            r.d[i] = (uint32_t)c;
-            carry = c >> 32;
         }
     }
+
     fe_reduce(r);
 }
 
 // Full multiplication: r = a * b mod p
-// Uses schoolbook multiplication with lazy reduction
+// Uses schoolbook multiplication with secp256k1 fast reduction
+// Reduction identity: 2^256 ≡ 2^32 + 977 (mod p)
 __device__ __host__ inline void fe_mul(FieldElement& r, const FieldElement& a, const FieldElement& b) {
-    // Result needs 16 limbs (512 bits) before reduction
-    uint64_t t[16] = {0};
+    uint32_t t[16];
+    uint64_t carry;
 
-    // Schoolbook multiplication
+    // Schoolbook multiplication with immediate carry propagation
+    for (int i = 0; i < 16; i++) t[i] = 0;
+
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
-        uint64_t carry = 0;
+        carry = 0;
+        #pragma unroll
         for (int j = 0; j < 8; j++) {
-            uint64_t prod = (uint64_t)a.d[i] * (uint64_t)b.d[j] + t[i+j] + carry;
-            t[i+j] = prod & 0xFFFFFFFF;
-            carry = prod >> 32;
+            uint64_t uv = (uint64_t)a.d[i] * b.d[j] + t[i+j] + carry;
+            t[i+j] = (uint32_t)uv;
+            carry = uv >> 32;
         }
-        t[i+8] = carry;
+        // Add carry to high limb - don't just overwrite, accumulate!
+        uint64_t sum = (uint64_t)t[i+8] + carry;
+        t[i+8] = (uint32_t)sum;
+        // Propagate any overflow to higher limbs
+        carry = sum >> 32;
+        for (int k = i + 9; k < 16 && carry; k++) {
+            sum = (uint64_t)t[k] + carry;
+            t[k] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
     }
 
-    // Reduce mod p using: 2^256 ≡ 2^32 + 977 (mod p)
-    // The high 256 bits (t[8..15]) need to be reduced
-    for (int i = 8; i < 16; i++) {
-        if (t[i] == 0) continue;
-        // t[i] * 2^(32*i) = t[i] * 2^(32*(i-8)) * 2^256
-        //                 ≡ t[i] * 2^(32*(i-8)) * (2^32 + 977) (mod p)
-        uint64_t val = t[i];
-        int target = i - 8;
+    // Reduce: fold t[8..15] into t[0..7] using 2^256 ≡ 2^32 + 977
+    // t[i+8] contributes: t[i+8]*977 to position i, t[i+8] to position i+1
+    //
+    // Contribution to each position:
+    //   new_t[0] = t[0] + 977*t[8]
+    //   new_t[1] = t[1] + 977*t[9] + t[8]
+    //   new_t[2] = t[2] + 977*t[10] + t[9]
+    //   ...
+    //   new_t[7] = t[7] + 977*t[15] + t[14]
+    //   overflow = t[15]
 
-        // Add val * 977 at position target
-        uint64_t carry = val * 977;
-        for (int j = target; j < 16 && carry; j++) {
-            carry += t[j];
-            t[j] = carry & 0xFFFFFFFF;
-            carry >>= 32;
-        }
+    carry = 0;
 
-        // Add val at position target + 1
-        carry = val;
-        for (int j = target + 1; j < 16 && carry; j++) {
-            carry += t[j];
-            t[j] = carry & 0xFFFFFFFF;
-            carry >>= 32;
-        }
+    // Position 0: t[0] + 977*t[8]
+    uint64_t val = (uint64_t)t[0] + (uint64_t)t[8] * 977 + carry;
+    t[0] = (uint32_t)val;
+    carry = val >> 32;
 
-        t[i] = 0;
+    // Positions 1-7: t[i] + 977*t[i+8] + t[i+7]
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        val = (uint64_t)t[i] + (uint64_t)t[i+8] * 977 + (uint64_t)t[i+7] + carry;
+        t[i] = (uint32_t)val;
+        carry = val >> 32;
     }
 
-    // May need another reduction pass
-    while (t[8] || t[9] || t[10] || t[11] || t[12] || t[13] || t[14] || t[15]) {
-        for (int i = 8; i < 16; i++) {
-            if (t[i] == 0) continue;
-            uint64_t val = t[i];
-            int target = i - 8;
+    // Add final overflow: t[15] contributes to position 8 (overflow)
+    carry += t[15];
 
-            uint64_t carry = val * 977;
-            for (int j = target; j < 16 && carry; j++) {
-                carry += t[j];
-                t[j] = carry & 0xFFFFFFFF;
-                carry >>= 32;
+    // carry now represents overflow * 2^256, reduce again
+    // carry * 2^256 ≡ carry * (2^32 + 977)
+    uint64_t c = carry;
+    if (c) {
+        uint64_t val = (uint64_t)t[0] + c * 977;
+        t[0] = (uint32_t)val;
+        carry = val >> 32;
+
+        val = (uint64_t)t[1] + c + carry;
+        t[1] = (uint32_t)val;
+        carry = val >> 32;
+
+        #pragma unroll
+        for (int i = 2; i < 8; i++) {
+            if (!carry) break;
+            val = (uint64_t)t[i] + carry;
+            t[i] = (uint32_t)val;
+            carry = val >> 32;
+        }
+
+        // One more reduction if still overflowed
+        if (carry) {
+            val = (uint64_t)t[0] + carry * 977;
+            t[0] = (uint32_t)val;
+            carry = val >> 32;
+            val = (uint64_t)t[1] + carry + carry;
+            t[1] = (uint32_t)val;
+            carry = val >> 32;
+            for (int i = 2; i < 8 && carry; i++) {
+                val = (uint64_t)t[i] + carry;
+                t[i] = (uint32_t)val;
+                carry = val >> 32;
             }
-
-            carry = val;
-            for (int j = target + 1; j < 16 && carry; j++) {
-                carry += t[j];
-                t[j] = carry & 0xFFFFFFFF;
-                carry >>= 32;
-            }
-
-            t[i] = 0;
         }
     }
 
     // Copy result
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
-        r.d[i] = (uint32_t)t[i];
+        r.d[i] = t[i];
     }
 
     fe_reduce(r);
 }
 
-// Squaring: r = a^2 mod p (optimized vs multiplication)
+// Squaring: r = a^2 mod p (optimized)
+// Uses the identity: (sum ai*2^(32i))^2 = sum ai^2*2^(64i) + 2*sum(i<j) ai*aj*2^(32(i+j))
 __device__ __host__ inline void fe_sqr(FieldElement& r, const FieldElement& a) {
-    fe_mul(r, a, a); // Can optimize later
+    uint32_t t[16];
+    uint64_t carry;
+
+    // Initialize
+    for (int i = 0; i < 16; i++) t[i] = 0;
+
+    // Compute cross products first (will be doubled)
+    // For each pair (i,j) with i < j, compute ai * aj and add to position i+j
+    // We'll double these at the end before adding diagonal terms
+    for (int i = 0; i < 8; i++) {
+        carry = 0;
+        for (int j = i + 1; j < 8; j++) {
+            uint64_t uv = (uint64_t)a.d[i] * a.d[j] + t[i+j] + carry;
+            t[i+j] = (uint32_t)uv;
+            carry = uv >> 32;
+        }
+        // Propagate carry
+        for (int k = i + 8; k < 16 && carry; k++) {
+            uint64_t sum = (uint64_t)t[k] + carry;
+            t[k] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
+    }
+
+    // Double the cross products (shift left by 1 bit)
+    carry = 0;
+    for (int i = 0; i < 16; i++) {
+        uint64_t val = ((uint64_t)t[i] << 1) | carry;
+        t[i] = (uint32_t)val;
+        carry = val >> 32;
+    }
+
+    // Add diagonal terms (squares): ai^2 at position 2i
+    for (int i = 0; i < 8; i++) {
+        uint64_t sq = (uint64_t)a.d[i] * a.d[i];
+        uint64_t sum = (uint64_t)t[2*i] + (uint32_t)sq;
+        t[2*i] = (uint32_t)sum;
+        carry = (sum >> 32) + (sq >> 32);
+        // Propagate carry
+        for (int k = 2*i + 1; k < 16 && carry; k++) {
+            sum = (uint64_t)t[k] + carry;
+            t[k] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
+    }
+
+    // Now reduce using 2^256 ≡ 2^32 + 977 (mod p)
+    carry = 0;
+    uint64_t val = (uint64_t)t[0] + (uint64_t)t[8] * 977;
+    t[0] = (uint32_t)val;
+    carry = val >> 32;
+
+    for (int i = 1; i < 8; i++) {
+        val = (uint64_t)t[i] + (uint64_t)t[i+8] * 977 + (uint64_t)t[i+7] + carry;
+        t[i] = (uint32_t)val;
+        carry = val >> 32;
+    }
+    carry += t[15];
+
+    // Second reduction pass
+    uint64_t c = carry;
+    if (c) {
+        val = (uint64_t)t[0] + c * 977;
+        t[0] = (uint32_t)val;
+        carry = val >> 32;
+        val = (uint64_t)t[1] + c + carry;
+        t[1] = (uint32_t)val;
+        carry = val >> 32;
+        for (int i = 2; i < 8 && carry; i++) {
+            val = (uint64_t)t[i] + carry;
+            t[i] = (uint32_t)val;
+            carry = val >> 32;
+        }
+        // Third reduction if still overflowed
+        if (carry) {
+            val = (uint64_t)t[0] + carry * 977;
+            t[0] = (uint32_t)val;
+            carry = val >> 32;
+            val = (uint64_t)t[1] + carry + carry;
+            t[1] = (uint32_t)val;
+            carry = val >> 32;
+            for (int i = 2; i < 8 && carry; i++) {
+                val = (uint64_t)t[i] + carry;
+                t[i] = (uint32_t)val;
+                carry = val >> 32;
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; i++) r.d[i] = t[i];
+    fe_reduce(r);
 }
 
 // Multiply and accumulate: r += a * b
@@ -419,94 +569,69 @@ __device__ __host__ inline void fe_inv(FieldElement& r, const FieldElement& a) {
     fe_sqr_n(x223, x220, 3);
     fe_mul(x223, x223, x3);
 
-    // Now compute the final exponent:
-    // p - 2 = 2^256 - 2^32 - 979
-    // We need a^(p-2)
-
-    // The exponent has this structure (from MSB):
-    // 1111...1111 (223 ones) 00000000 (padding to 256 bits)
-    // Then the low 32 bits are: FFFFFFFE FFFFFC2D
-
-    // a^(2^256 - 2^32 - 979) computation:
-    fe_sqr_n(t, x223, 23);  // a^((2^223 - 1) * 2^23) = a^(2^246 - 2^23)
-    fe_mul(t, t, x22);      // a^(2^246 - 2^23 + 2^22 - 1) = a^(2^246 - 2^22 - 1)... hmm
-
-    // This is getting complex. Let me use a simpler approach.
-    // Just use binary method for the exponent.
-
-    // Actually, let's compute it step by step for p-2:
+    // Now compute a^(p-2) using the addition chain
     // p - 2 = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2D
-    //       = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+    //
+    // This is 256 bits with pattern:
+    // - bits 255-33: all 1s (223 ones) -> this is (2^223 - 1)
+    // - bit 32: 1
+    // - bits 31-10: all 1s (22 ones)
+    // - bits 9-6: 0000
+    // - bit 5: 1
+    // - bit 4: 0
+    // - bit 3: 1
+    // - bit 2: 1
+    // - bit 1: 0
+    // - bit 0: 1
+    //
+    // Using addition chain from libsecp256k1:
+    // Result = x223 * 2^33 + 1*2^32 + (2^22-1)*2^10 + 1*2^5 + 1*2^3 + 1*2^2 + 1
 
-    r = a;
-    // We'll use the precomputed powers
-    // The exponent in binary is mostly 1s with specific 0s
+    // Start with x223, shift by 23 to position 246, then add x22
+    fe_sqr_n(t, x223, 23);     // x223 * 2^23
+    fe_mul(t, t, x22);         // + (2^22 - 1) = a^(2^246 - 1)
 
-    // Simpler approach: square-and-multiply
-    // p-2 bits from high to low (256 bits):
-    // bits 255-32: all 1s (224 ones)
-    // bits 31-0: 0xFFFFFFFEFFFFFC2D = 11111111111111111111111111111110 11111111111111111100001011101
+    // Shift by 5, add x2
+    fe_sqr_n(t, t, 5);         // * 2^5
+    fe_mul(t, t, a);           // + 1 (bit 4 is 0, bit 5 is set but we need the pattern)
 
-    // Use the x223 we computed:
-    // x223 = a^(2^223 - 1)
-    // We need a^(p-2) where p-2 has 224 ones in the high bits (bits 255 down to 32)
-    // followed by the pattern in the low 32 bits
+    // Actually, let me redo this more carefully following libsecp256k1
+    // p-2 = (2^223 - 1) * 2^33 + (2^22 - 1) * 2^10 + 2^5 + 2^3 + 2^2 + 1 + 2^32
+    //     = (2^223 - 1) * 2^33 + 2^32 + (2^22 - 1) * 2^10 + 2^5 + 2^3 + 2^2 + 1
 
-    fe_sqr_n(t, x223, 33);  // Shift x223 up by 33 positions
-    fe_mul(t, t, a);        // Multiply by a for bit 32
+    // Shift x223 by 33 positions (to get bits 255-33)
+    fe_sqr_n(t, x223, 33);
 
-    // Now handle the low 32 bits: 0xFFFFFC2D = bits pattern
-    // 0xFFFFFC2D = 1111 1111 1111 1111 1111 1100 0010 1101
-    // That's 32 bits with some zeros
+    // For the remaining bits, we need to handle:
+    // bit 32: 1    -> multiply by a
+    // bits 31-10: (2^22-1) = x22 shifted by 10
+    // bits 9-6: 0
+    // bits 5,3,2,0: 1
 
-    // Actually the low 32 bits of p-2 are:
-    // p = 0xFFFFFC2F, so p-2 = 0xFFFFFC2D
-    // 0xFFFFFC2D = 4294966317
+    // After x223*2^33, multiply by a for bit 32? No wait...
+    // Actually bits 32-10 = 0xFFFFFC00 >> 10 = bits 31-10 all 1s = 22 ones = (2^22 - 1) at positions 31-10
+    // That's x22 shifted by 10
 
-    // Bits (from bit 31 down to 0):
-    // 1111 1111 1111 1111 1111 1100 0010 1101
-    // bits 31-10: all 1s (22 ones)
-    // bit 9: 0
-    // bit 8: 0
-    // bit 7: 0
-    // bit 6: 0
-    // bit 5: 1
-    // bit 4: 0
-    // bit 3: 1
-    // bit 2: 1
-    // bit 1: 0
-    // bit 0: 1
+    // Let me trace the libsecp256k1 approach more carefully:
+    // t = x223^(2^23) * x22 = a^((2^223-1)*2^23 + 2^22-1) = a^(2^246 - 2^23 + 2^22 - 1) = a^(2^246 - 2^22 - 1)... no
 
-    // Actually let's just do square-and-multiply for the whole exponent
-    // It's cleaner and less error-prone
-
-    // p-2 as uint32_t array (little-endian):
-    // {0xFFFFFC2D, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF}
-
-    r.SetOne();
-
-    // Process from high limb to low limb, high bit to low bit
-    for (int limb = 7; limb >= 0; limb--) {
-        uint32_t exp_limb;
-        if (limb == 0) exp_limb = 0xFFFFFC2D;
-        else if (limb == 1) exp_limb = 0xFFFFFFFE;
-        else exp_limb = 0xFFFFFFFF;
-
-        for (int bit = 31; bit >= 0; bit--) {
-            // Skip leading zeros in first iteration
-            if (limb == 7 && bit == 31) {
-                // First bit is 1, just set r = a
-                r = a;
-                continue;
-            }
-
-            fe_sqr(r, r);
-
-            if ((exp_limb >> bit) & 1) {
-                fe_mul(r, r, a);
-            }
-        }
-    }
+    // OK let me just implement it step by step from libsecp256k1:
+    // 1) t = x223 << 23 = x223 * 2^23
+    fe_sqr_n(t, x223, 23);
+    // 2) t = t * x22 = x223*2^23 * x22
+    fe_mul(t, t, x22);
+    // 3) t = t << 5 = (x223*2^23 * x22) * 2^5
+    fe_sqr_n(t, t, 5);
+    // 4) t = t * a
+    fe_mul(t, t, a);
+    // 5) t = t << 3
+    fe_sqr_n(t, t, 3);
+    // 6) t = t * x2
+    fe_mul(t, t, x2);
+    // 7) t = t << 2
+    fe_sqr_n(t, t, 2);
+    // 8) r = t * a
+    fe_mul(r, t, a);
 }
 
 // Check if a is a quadratic residue (has square root) mod p

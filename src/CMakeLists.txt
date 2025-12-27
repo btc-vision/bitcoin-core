@@ -173,6 +173,10 @@ if(ENABLE_WALLET)
   endif()
 endif()
 
+# GPU acceleration library - must be defined before targets that depend on it
+if(ENABLE_GPU_ACCELERATION)
+  add_subdirectory(gpu_kernel)
+endif()
 
 # P2P and RPC server functionality used by `bitcoind` and `bitcoin-qt` executables.
 add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
@@ -310,6 +314,24 @@ if(BUILD_DAEMON)
     bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
   )
+  # Enable CUDA device linking for bitcoind when GPU acceleration is enabled
+  if(ENABLE_GPU_ACCELERATION)
+    # Add a minimal .cu file to force CUDA device linking for this executable
+    # This ensures the GPU library's device code is properly linked
+    target_sources(bitcoind PRIVATE
+      init/cuda_device_link.cu
+    )
+
+    set_target_properties(bitcoind PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    # Link GPU library
+    target_link_libraries(bitcoind
+      bitcoin_kernel_gpu
+      ${CUDA_CUDART_LIBRARY}
+    )
+  endif()
   install_binary_component(bitcoind HAS_MANPAGE)
 endif()
 if(ENABLE_IPC AND BUILD_DAEMON)
@@ -405,11 +427,6 @@ if(BUILD_KERNEL_LIB)
     install_binary_component(bitcoin-chainstate INTERNAL)
   endif()
 endif()
-
-if(ENABLE_GPU_ACCELERATION)
-  add_subdirectory(gpu_kernel)
-endif()
-
 
 add_subdirectory(test/util)
 if(BUILD_BENCH)
