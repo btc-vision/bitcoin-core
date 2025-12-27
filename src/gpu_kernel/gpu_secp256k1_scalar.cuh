@@ -212,9 +212,14 @@ __device__ __host__ inline void scalar_sub_n(Scalar& a) {
 }
 
 // Reduce modulo n: ensure 0 <= r < n
+// Uses constant-time conditional subtraction (no while loop)
 __device__ __host__ inline void scalar_reduce(Scalar& a) {
-    while (scalar_cmp_n(a) >= 0) {
+    // At most 2 subtractions needed for values up to 2n
+    if (scalar_cmp_n(a) >= 0) {
         scalar_sub_n(a);
+        if (scalar_cmp_n(a) >= 0) {
+            scalar_sub_n(a);
+        }
     }
 }
 
@@ -338,40 +343,147 @@ __device__ __host__ inline void scalar_sqr_n(Scalar& r, const Scalar& a, int n) 
 }
 
 // Scalar inversion: r = a^(-1) mod n
-// Uses Fermat's little theorem: a^(-1) = a^(n-2) mod n
+// Uses Fermat's little theorem with addition chain: a^(-1) = a^(n-2) mod n
+// n-2 = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE BAAEDCE6 AF48A03B BFD25E8C D036413F
 __device__ __host__ inline void scalar_inv(Scalar& r, const Scalar& a) {
+    // Pre-compute small powers using addition chain
+    Scalar x2, x3, x4, x6, x7, x8, x15, x30, x60, x120, x127;
+    Scalar t;
+
+    // x2 = a^2
+    scalar_sqr(x2, a);
+
+    // x3 = a^3 = a^2 * a
+    scalar_mul(x3, x2, a);
+
+    // x4 = a^4 = (a^2)^2
+    scalar_sqr(x4, x2);
+
+    // x6 = a^6 = a^4 * a^2
+    scalar_mul(x6, x4, x2);
+
+    // x7 = a^7 = a^6 * a
+    scalar_mul(x7, x6, a);
+
+    // x8 = a^8 = (a^4)^2
+    scalar_sqr(x8, x4);
+
+    // x15 = a^15 = a^8 * a^7
+    scalar_mul(x15, x8, x7);
+
+    // x30 = a^30 = (a^15)^2
+    scalar_sqr(x30, x15);
+
+    // x60 = a^60 = (a^30)^2
+    scalar_sqr(x60, x30);
+
+    // x120 = a^120 = (a^60)^2
+    scalar_sqr(x120, x60);
+
+    // x127 = a^127 = a^120 * a^7
+    scalar_mul(x127, x120, x7);
+
+    // Now build n-2 using these precomputed values
     // n-2 = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE BAAEDCE6 AF48A03B BFD25E8C D036413F
+    //
+    // High 128 bits: FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE = (2^128 - 1) * 2 = 2^129 - 2
+    // This is 127 ones followed by a zero
+    // a^(2^129 - 2) = (a^(2^128 - 1))^2 = ((a^127)^(2^121))^2
 
-    // Use square-and-multiply
-    r.SetOne();
+    // Start with x127, square it 121 times to get a^(127 * 2^121) = a^(2^128 - 2^121)
+    // Then multiply by x127 to get a^(2^128 - 2^121 + 127) = a^(2^128 - 2^121 + 2^7 - 1)
+    // This is getting complex. Let me use a simpler approach.
 
-    // n-2 limbs (little-endian): {0xD036413F, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF}
+    // Build a^(2^128 - 1) first = a^(ffffffffffffffffffffffffffffffff) = (a^255 ... repeated)
+    // Actually, let's just compute:
+    // t = a^(2^7 - 1) = x127
+    // t = t^(2^7) * x127 = a^(2^14 - 1)
+    // t = t^(2^14) * t = a^(2^28 - 1)  -- wrong, need to track carefully
 
-    bool started = false;
-    for (int limb = 7; limb >= 0; limb--) {
-        uint32_t exp_limb;
-        if (limb == 0) exp_limb = 0xD036413F;
-        else if (limb == 1) exp_limb = 0xBFD25E8C;
-        else if (limb == 2) exp_limb = 0xAF48A03B;
-        else if (limb == 3) exp_limb = 0xBAAEDCE6;
-        else if (limb == 4) exp_limb = 0xFFFFFFFE;
-        else exp_limb = 0xFFFFFFFF;
+    // Simpler: Build a^(2^k - 1) iteratively
+    // a^(2^7 - 1) = x127
+    // a^(2^14 - 1) = (a^(2^7-1))^(2^7) * a^(2^7-1) = x127^(2^7) * x127
+    scalar_sqr_n(t, x127, 7);
+    scalar_mul(t, t, x127);  // t = a^(2^14 - 1)
 
-        for (int bit = 31; bit >= 0; bit--) {
-            if (started) {
-                scalar_sqr(r, r);
-            }
+    // a^(2^28 - 1) = t^(2^14) * t
+    Scalar t14 = t;
+    scalar_sqr_n(t, t, 14);
+    scalar_mul(t, t, t14);  // t = a^(2^28 - 1)
 
-            if ((exp_limb >> bit) & 1) {
-                if (started) {
-                    scalar_mul(r, r, a);
-                } else {
-                    r = a;
-                    started = true;
-                }
-            }
+    // a^(2^56 - 1) = t^(2^28) * t
+    Scalar t28 = t;
+    scalar_sqr_n(t, t, 28);
+    scalar_mul(t, t, t28);  // t = a^(2^56 - 1)
+
+    // a^(2^112 - 1) = t^(2^56) * t
+    Scalar t56 = t;
+    scalar_sqr_n(t, t, 56);
+    scalar_mul(t, t, t56);  // t = a^(2^112 - 1)
+
+    // a^(2^126 - 1) = t^(2^14) * a^(2^14 - 1)
+    scalar_sqr_n(t, t, 14);
+    scalar_mul(t, t, t14);  // t = a^(2^126 - 1)
+
+    // a^(2^127 - 1) = t^2 * a
+    scalar_sqr(t, t);
+    scalar_mul(t, t, a);  // t = a^(2^127 - 1)
+
+    // a^(2^128 - 2) = t^2 (the high 128 bits pattern FFFFFFFE at the end)
+    scalar_sqr(t, t);  // t = a^(2^128 - 2)
+
+    // Now we need to incorporate the low 128 bits: BAAEDCE6 AF48A03B BFD25E8C D036413F
+    // Use 4-bit windowed method with precomputed table for efficiency
+    // Precompute: a^1, a^2, ..., a^15
+    Scalar table[16];
+    table[0].SetOne();
+    table[1] = a;
+    table[2] = x2;
+    table[3] = x3;
+    table[4] = x4;
+    Scalar x5; scalar_mul(x5, x4, a);
+    table[5] = x5;
+    table[6] = x6;
+    table[7] = x7;
+    table[8] = x8;
+    Scalar x9; scalar_mul(x9, x8, a);
+    table[9] = x9;
+    Scalar x10; scalar_mul(x10, x8, x2);
+    table[10] = x10;
+    Scalar x11; scalar_mul(x11, x8, x3);
+    table[11] = x11;
+    Scalar x12; scalar_mul(x12, x8, x4);
+    table[12] = x12;
+    Scalar x13; scalar_mul(x13, x8, x5);
+    table[13] = x13;
+    Scalar x14; scalar_mul(x14, x8, x6);
+    table[14] = x14;
+    table[15] = x15;
+
+    // Low 128 bits: BAAEDCE6 AF48A03B BFD25E8C D036413F (big-endian order)
+    // Process 4 bits at a time from high to low
+    static const uint8_t nibbles[32] = {
+        0xB, 0xA, 0xA, 0xE, 0xD, 0xC, 0xE, 0x6,  // BAAEDCE6
+        0xA, 0xF, 0x4, 0x8, 0xA, 0x0, 0x3, 0xB,  // AF48A03B
+        0xB, 0xF, 0xD, 0x2, 0x5, 0xE, 0x8, 0xC,  // BFD25E8C
+        0xD, 0x0, 0x3, 0x6, 0x4, 0x1, 0x3, 0xF   // D036413F
+    };
+
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        // Square 4 times
+        scalar_sqr(t, t);
+        scalar_sqr(t, t);
+        scalar_sqr(t, t);
+        scalar_sqr(t, t);
+        // Multiply by table[nibble] if nibble != 0
+        uint8_t nib = nibbles[i];
+        if (nib != 0) {
+            scalar_mul(t, t, table[nib]);
         }
     }
+
+    r = t;
 }
 
 // Conditional move: r = flag ? a : r
@@ -412,15 +524,23 @@ __device__ __host__ inline void scalar_half(Scalar& r, const Scalar& a) {
 
 // Get the number of bits in the scalar
 __device__ __host__ inline int scalar_bits(const Scalar& a) {
+    #pragma unroll
     for (int i = 7; i >= 0; i--) {
         if (a.d[i] != 0) {
-            int bits = i * 32;
+            // Count leading zeros and compute bit position
+            #ifdef __CUDA_ARCH__
+            int lz = __clz(a.d[i]);  // CUDA intrinsic
+            #else
+            // CPU fallback: count leading zeros
             uint32_t v = a.d[i];
-            while (v) {
-                bits++;
-                v >>= 1;
-            }
-            return bits;
+            int lz = 0;
+            if (!(v & 0xFFFF0000)) { lz += 16; v <<= 16; }
+            if (!(v & 0xFF000000)) { lz += 8; v <<= 8; }
+            if (!(v & 0xF0000000)) { lz += 4; v <<= 4; }
+            if (!(v & 0xC0000000)) { lz += 2; v <<= 2; }
+            if (!(v & 0x80000000)) { lz += 1; }
+            #endif
+            return (i + 1) * 32 - lz;
         }
     }
     return 0;

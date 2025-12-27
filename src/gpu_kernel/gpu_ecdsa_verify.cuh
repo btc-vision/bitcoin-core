@@ -188,23 +188,18 @@ __device__ __host__ inline bool ecdsa_verify_core(
     scalar_mul(u2, sig_r, w);
 
     // Compute R = u1 * G + u2 * Q
-    // First, get generator point
-    AffinePoint g_affine;
-    GetGenerator(g_affine);
-
-    JacobianPoint g_jac;
-    g_jac.FromAffine(g_affine);
-
     JacobianPoint q_jac;
     q_jac.FromAffine(pubkey);
 
-    // Compute u1 * G
-    JacobianPoint r1;
-    ecmult_simple(r1, g_jac, u1);
+    // Use simple multiplication (fallback without precomputed table)
+    AffinePoint g_affine;
+    GetGenerator(g_affine);
+    JacobianPoint g_jac;
+    g_jac.FromAffine(g_affine);
 
-    // Compute u2 * Q
-    JacobianPoint r2;
-    ecmult_simple(r2, q_jac, u2);
+    JacobianPoint r1, r2;
+    ecmult_simple(r1, g_jac, u1);  // u1 * G
+    ecmult_simple(r2, q_jac, u2);  // u2 * Q
 
     // R = r1 + r2
     JacobianPoint R;
@@ -252,6 +247,77 @@ __device__ __host__ inline bool ecdsa_verify(
 
     // Verify
     return ecdsa_verify_core(sighash, r, s, pubkey);
+}
+
+// ECDSA verification with precomputed generator table (FAST)
+__device__ __host__ inline bool ecdsa_verify_fast(
+    const uint8_t* sig, uint32_t sig_len,
+    const uint8_t* sighash,
+    const uint8_t* pubkey_data, uint32_t pubkey_len,
+    const GeneratorTable& gen_table)
+{
+    // Parse signature
+    Scalar r, s;
+    if (!sig_parse_der_simple(r, s, sig, sig_len)) {
+        return false;
+    }
+
+    // Parse public key
+    AffinePoint pubkey;
+    if (!pubkey_parse(pubkey, pubkey_data, pubkey_len)) {
+        return false;
+    }
+
+    // Check r and s are in range [1, n-1]
+    if (r.IsZero() || s.IsZero()) return false;
+    if (scalar_cmp_n(r) >= 0) return false;
+    if (scalar_cmp_n(s) >= 0) return false;
+
+    // Convert message hash to scalar
+    Scalar e;
+    e.SetBytes(sighash);
+    scalar_reduce(e);
+
+    // Compute w = s^(-1) mod n
+    Scalar w;
+    scalar_inv(w, s);
+
+    // Compute u1 = e * w mod n
+    Scalar u1;
+    scalar_mul(u1, e, w);
+
+    // Compute u2 = r * w mod n
+    Scalar u2;
+    scalar_mul(u2, r, w);
+
+    // Compute R = u1 * G + u2 * Q using precomputed table for G
+    JacobianPoint q_jac;
+    q_jac.FromAffine(pubkey);
+
+    JacobianPoint r1, r2;
+    ecmult_gen(r1, gen_table, u1);  // u1 * G using precomputed table (FAST!)
+    ecmult_simple(r2, q_jac, u2);    // u2 * Q
+
+    // R = r1 + r2
+    JacobianPoint R;
+    point_add(R, r1, r2);
+
+    if (R.IsInfinity()) return false;
+
+    // Get R.x
+    FieldElement rx;
+    point_get_x(rx, R);
+
+    // Convert rx to scalar (mod n)
+    uint8_t rx_bytes[32];
+    rx.GetBytes(rx_bytes);
+
+    Scalar rx_scalar;
+    rx_scalar.SetBytes(rx_bytes);
+    scalar_reduce(rx_scalar);
+
+    // Verify rx == r
+    return rx_scalar.IsEqual(r);
 }
 
 // ============================================================================

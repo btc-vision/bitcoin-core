@@ -162,6 +162,7 @@ __device__ __host__ inline void GetGenerator(AffinePoint& g) {
 // Uses the formula from "Guide to ECC", algorithm 3.21
 // Cost: 1M + 5S + 1*a + 7add + 2*2 + 1*3 + 1*8
 // For secp256k1, a = 0, so we save a multiplication
+// Note: Handles aliasing (r == p) correctly
 __device__ __host__ inline void point_double(JacobianPoint& r, const JacobianPoint& p) {
     if (p.IsInfinity()) {
         r.SetInfinity();
@@ -170,8 +171,13 @@ __device__ __host__ inline void point_double(JacobianPoint& r, const JacobianPoi
 
     FieldElement t1, t2, t3, t4, t5;
 
+    // Save p.y and p.z early since we'll overwrite r.y before using them for Z3
+    // (needed when r aliases p)
+    FieldElement py = p.y;
+    FieldElement pz = p.z;
+
     // t1 = Y^2
-    fe_sqr(t1, p.y);
+    fe_sqr(t1, py);
 
     // t2 = 4 * X * Y^2
     fe_mul(t2, p.x, t1);
@@ -199,8 +205,8 @@ __device__ __host__ inline void point_double(JacobianPoint& r, const JacobianPoi
     fe_mul(r.y, t4, t5);
     fe_sub(r.y, r.y, t3);
 
-    // Z3 = 2 * Y * Z
-    fe_mul(r.z, p.y, p.z);
+    // Z3 = 2 * Y * Z (use saved py, pz)
+    fe_mul(r.z, py, pz);
     fe_add(r.z, r.z, r.z);
 }
 

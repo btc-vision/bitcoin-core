@@ -77,7 +77,7 @@ if(ENABLE_GPU_ACCELERATION)
   )
   
   target_compile_options(bitcoin_kernel_gpu PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--threads 0 --expt-relaxed-constexpr -UNDEBUG --std=c++20>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads 0 --expt-relaxed-constexpr -UNDEBUG --std=c++20 -rdc=true>
   )
   
   # Find cuFile library for GPUDirect Storage

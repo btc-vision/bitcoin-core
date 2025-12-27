@@ -18,18 +18,21 @@ namespace gpu {
 // Stack limits - 520 bytes per element for ALL sigversions
 // The 520-byte limit applies to stack elements (sigs, pubkeys, data)
 // The tapscript itself is passed directly to EvalScript and can be larger
-constexpr uint32_t MAX_STACK_SIZE = 1000;
-constexpr uint32_t MAX_STACK_ELEMENT_SIZE = 520;            // 520 bytes for all sigversions
+constexpr uint32_t MAX_STACK_SIZE = 1000;                    // Consensus limit (for CPU fallback)
+constexpr uint32_t MAX_STACK_ELEMENT_SIZE = 520;             // 520 bytes for all sigversions
 constexpr uint32_t MAX_SCRIPT_SIZE = 10000;
-constexpr uint32_t MAX_SCRIPT_ELEMENT_SIZE = 520;           // Legacy push limit check
+constexpr uint32_t MAX_SCRIPT_ELEMENT_SIZE = 520;            // Legacy push limit check
 constexpr uint32_t MAX_OPS_PER_SCRIPT = 201;
 constexpr uint32_t MAX_PUBKEYS_PER_MULTISIG = 20;
 constexpr int64_t MAX_SCRIPT_NUM_LENGTH = 4;  // Default, 5 for locktime
 
-// GPU-optimized stack sizes for different script complexity levels
-// Simple scripts (P2WPKH, P2TR key-path, P2PKH) use small local stacks
-// Complex scripts (multisig, P2WSH) fall back to global memory
-constexpr uint32_t GPU_SMALL_STACK_SIZE = 16;   // For simple scripts (~17KB per context)
+// GPU-optimized stack sizes
+// 99% of scripts (P2WPKH, P2TR, P2PKH) need only 4-8 elements
+// Complex scripts (large multisig) are rare and can use CPU fallback
+// GPU_CONTEXT_STACK_SIZE=64 handles up to 20-of-20 multisig with room to spare
+// Context size: 64 * 522 * 2 = ~67KB per context (vs 1MB before)
+constexpr uint32_t GPU_CONTEXT_STACK_SIZE = 64;              // GPU context stack limit
+constexpr uint32_t GPU_SMALL_STACK_SIZE = 16;                // For very simple scripts
 
 // Tapscript limits (BIP342)
 // - The 520-byte element size limit is REMOVED

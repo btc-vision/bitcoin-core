@@ -135,7 +135,9 @@ static std::unique_ptr<gpu::GPUUTXOSet> g_gpu_utxo_set;
 static std::unique_ptr<gpu::GPUBatchValidator> g_gpu_block_validator;
 static bool g_gpu_block_enabled = false;
 static bool g_gpu_block_validation_enabled = false;
+static bool g_gpu_utxo_enabled = false;  // -gpuutxo flag (default off - not needed for sig verification)
 static bool g_gpu_utxo_loaded = false;
+static bool g_gpu_logging_enabled = false;
 static std::mutex g_gpu_mutex;  // Protect GPU state during reorgs
 
 // Reserve 2GB for batch validator (script contexts need ~1MB each, 1000 contexts = ~1GB)
@@ -148,6 +150,8 @@ static bool InitGPUBlockValidation() {
 
     g_gpu_block_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
     g_gpu_block_validation_enabled = gArgs.GetBoolArg("-gpuvalidation", true);
+    g_gpu_utxo_enabled = gArgs.GetBoolArg("-gpuutxo", false);  // Default OFF - not needed for sig verification
+    g_gpu_logging_enabled = gArgs.GetBoolArg("-gpulogging", false);
 
     if (!g_gpu_block_enabled) return false;
 
@@ -155,22 +159,25 @@ static bool InitGPUBlockValidation() {
     int64_t vram_mb = gArgs.GetIntArg("-gpuvram", 8192);
     size_t vram_limit = static_cast<size_t>(vram_mb) * 1024 * 1024;
 
-    // Reserve space for batch validator if validation is enabled
-    size_t utxo_limit = vram_limit;
-    if (g_gpu_block_validation_enabled && vram_limit > GPU_BATCH_VALIDATOR_RESERVE) {
-        utxo_limit = vram_limit - GPU_BATCH_VALIDATOR_RESERVE;
-        LogInfo("GPU: Reserving %zu MB for batch validator, %zu MB for UTXO set\n",
-                GPU_BATCH_VALIDATOR_RESERVE / (1024 * 1024), utxo_limit / (1024 * 1024));
-    }
+    // GPU UTXO set is optional - only needed if -gpuutxo=1
+    // By default, CPU computes sighashes and passes them pre-computed to GPU
+    if (g_gpu_utxo_enabled) {
+        size_t utxo_limit = vram_limit;
+        if (g_gpu_block_validation_enabled && vram_limit > GPU_BATCH_VALIDATOR_RESERVE) {
+            utxo_limit = vram_limit - GPU_BATCH_VALIDATOR_RESERVE;
+            LogInfo("GPU: Reserving %zu MB for batch validator, %zu MB for UTXO set\n",
+                    GPU_BATCH_VALIDATOR_RESERVE / (1024 * 1024), utxo_limit / (1024 * 1024));
+        }
 
-    g_gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
-    if (!g_gpu_utxo_set->Initialize(utxo_limit)) {
-        LogWarning("GPU UTXO set initialization failed, falling back to CPU\n");
-        g_gpu_block_enabled = false;
-        g_gpu_utxo_set.reset();
-        return false;
+        g_gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
+        if (!g_gpu_utxo_set->Initialize(utxo_limit)) {
+            LogWarning("GPU UTXO set initialization failed, continuing without GPU UTXO\n");
+            g_gpu_utxo_enabled = false;
+            g_gpu_utxo_set.reset();
+        } else {
+            LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", utxo_limit / (1024 * 1024));
+        }
     }
-    LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", utxo_limit / (1024 * 1024));
 
     if (g_gpu_block_validation_enabled) {
         g_gpu_block_validator = std::make_unique<gpu::GPUBatchValidator>();
@@ -179,8 +186,13 @@ static bool InitGPUBlockValidation() {
             g_gpu_block_validation_enabled = false;
             g_gpu_block_validator.reset();
         } else {
-            LogInfo("GPU block batch validator initialized\n");
-            g_gpu_block_validator->SetUTXOSet(g_gpu_utxo_set.get());
+            if (g_gpu_utxo_enabled && g_gpu_utxo_set) {
+                LogInfo("GPU batch validator initialized with GPU UTXO set\n");
+                g_gpu_block_validator->SetUTXOSet(g_gpu_utxo_set.get());
+            } else {
+                LogInfo("GPU batch validator initialized (using pre-computed sighashes from CPU)\n");
+            }
+            g_gpu_block_validator->SetLogging(g_gpu_logging_enabled);
         }
     }
 
@@ -3044,80 +3056,51 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
 
 #ifdef ENABLE_GPU_ACCELERATION
-    // Initialize GPU acceleration for this block if enabled
-    static bool gpu_enabled = gArgs.GetBoolArg("-gpuacceleration", false);
-    static bool gpu_validation_enabled = gArgs.GetBoolArg("-gpuvalidation", true);
-    static std::unique_ptr<gpu::GPUUTXOSet> gpu_utxo_set;
-    static std::unique_ptr<gpu::GPUBatchValidator> gpu_batch_validator;
-    static bool gpu_utxo_loaded = false;
-    static size_t vram_limit = static_cast<size_t>(gArgs.GetIntArg("-gpuvram", 8192)) * 1024 * 1024; // From -gpuvram arg (MB)
-
+    // Use global GPU validators (initialized via InitGPUBlockValidation)
     // Track which transactions need GPU validation
     std::vector<size_t> gpu_validation_tx_indices;
     std::vector<std::vector<int>> gpu_job_indices;  // job indices per transaction
 
-    if (gpu_enabled && !fJustCheck && fScriptChecks) {
-        if (!gpu_utxo_set) {
-            gpu_utxo_set = std::make_unique<gpu::GPUUTXOSet>();
-            if (!gpu_utxo_set->Initialize(vram_limit)) {
-                LogWarning("GPU UTXO set initialization failed, falling back to CPU\n");
-                gpu_enabled = false;
-                gpu_utxo_set.reset();
-            } else {
-                LogInfo("GPU UTXO set initialized with %zu MB VRAM limit\n", vram_limit / (1024 * 1024));
-            }
-        }
+    // Initialize global GPU state if not done yet
+    if (!g_gpu_block_enabled && !fJustCheck && fScriptChecks) {
+        std::lock_guard<std::mutex> lock(g_gpu_mutex);
+        InitGPUBlockValidation();
+    }
 
-        // Initialize batch validator
-        if (gpu_validation_enabled && !gpu_batch_validator) {
-            gpu_batch_validator = std::make_unique<gpu::GPUBatchValidator>();
-            if (!gpu_batch_validator->Initialize()) {
-                LogWarning("GPU batch validator initialization failed, falling back to CPU\n");
-                gpu_validation_enabled = false;
-                gpu_batch_validator.reset();
-            } else {
-                LogInfo("GPU batch validator initialized\n");
-                if (gpu_utxo_set) {
-                    gpu_batch_validator->SetUTXOSet(gpu_utxo_set.get());
-                }
-            }
-        }
-
-        // Load entire UTXO set to GPU on first use (hybrid mode)
-        if (gpu_utxo_set && !gpu_utxo_loaded) {
-            LogInfo("Loading entire UTXO set to GPU VRAM for hybrid CPU-GPU validation...\n");
+    // GPU UTXO loading - only if -gpuutxo=1 is set
+    if (g_gpu_utxo_enabled && g_gpu_utxo_set && !g_gpu_utxo_loaded && !fJustCheck && fScriptChecks) {
+        std::lock_guard<std::mutex> lock(g_gpu_mutex);
+        if (!g_gpu_utxo_loaded) {  // Double-check after acquiring lock
+            LogInfo("Loading entire UTXO set to GPU VRAM (-gpuutxo=1)...\n");
             auto load_start = SteadyClock::now();
 
-            // Pass the coins cache view to load all UTXOs
-            if (gpu_utxo_set->LoadFromCPU(&view)) {
+            if (g_gpu_utxo_set->LoadFromCPU(&view)) {
                 auto load_time = SteadyClock::now() - load_start;
                 LogInfo("Successfully loaded %zu UTXOs to GPU in %.2f seconds\n",
-                        gpu_utxo_set->GetNumUTXOs(),
+                        g_gpu_utxo_set->GetNumUTXOs(),
                         Ticks<SecondsDouble>(load_time));
-                LogInfo("GPU VRAM usage: %zu MB / %zu MB\n",
-                        gpu_utxo_set->GetVRAMUsage() / (1024 * 1024),
-                        vram_limit / (1024 * 1024));
-                gpu_utxo_loaded = true;
+                LogInfo("GPU VRAM usage: %zu MB\n",
+                        g_gpu_utxo_set->GetVRAMUsage() / (1024 * 1024));
+                g_gpu_utxo_loaded = true;
             } else {
-                LogWarning("Failed to load UTXO set to GPU, falling back to CPU-only validation\n");
-                gpu_enabled = false;
-                gpu_utxo_set.reset();
+                LogWarning("Failed to load UTXO set to GPU, continuing without GPU UTXO\n");
+                g_gpu_utxo_enabled = false;
             }
         }
+    }
 
-        // Check if compaction is needed
-        if (gpu_utxo_set && gpu_utxo_loaded && gpu_utxo_set->NeedsCompaction()) {
-            LogDebug(BCLog::BENCH, "GPU UTXO set fragmentation detected, running compaction...\n");
-            if (gpu_utxo_set->Compact()) {
-                LogDebug(BCLog::BENCH, "GPU UTXO compaction completed successfully\n");
-            }
+    // Check if compaction is needed (only if GPU UTXO is enabled)
+    if (g_gpu_utxo_enabled && g_gpu_utxo_set && g_gpu_utxo_loaded && g_gpu_utxo_set->NeedsCompaction()) {
+        LogDebug(BCLog::BENCH, "GPU UTXO set fragmentation detected, running compaction...\n");
+        if (g_gpu_utxo_set->Compact()) {
+            LogDebug(BCLog::BENCH, "GPU UTXO compaction completed successfully\n");
         }
+    }
 
-        // Begin batch for this block
-        if (gpu_batch_validator && gpu_validation_enabled) {
-            gpu_batch_validator->BeginBatch();
-            gpu_job_indices.resize(block.vtx.size());
-        }
+    // Begin batch for this block
+    if (g_gpu_block_validator && g_gpu_block_validation_enabled && !fJustCheck && fScriptChecks) {
+        g_gpu_block_validator->BeginBatch();
+        gpu_job_indices.resize(block.vtx.size());
     }
 #endif
 
@@ -3125,7 +3108,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // When GPU handles script validation, we don't need the CPU thread pool
     std::optional<CCheckQueueControl<CScriptCheck>> control;
 #ifdef ENABLE_GPU_ACCELERATION
-    bool use_gpu_validation = gpu_enabled && gpu_batch_validator && gpu_validation_enabled;
+    bool use_gpu_validation = g_gpu_block_enabled && g_gpu_block_validator && g_gpu_block_validation_enabled && fScriptChecks;
+    bool gpu_logging = g_gpu_block_validator && g_gpu_block_validator->GetLogging();
+    if (gpu_logging) {
+        fprintf(stderr, "[GPU DEBUG] use_gpu_validation=%d (g_gpu_block_enabled=%d, g_gpu_block_validator=%p, g_gpu_block_validation_enabled=%d, fScriptChecks=%d)\n",
+                use_gpu_validation, g_gpu_block_enabled, (void*)g_gpu_block_validator.get(), g_gpu_block_validation_enabled, fScriptChecks);
+        fflush(stderr);
+    }
     if (!use_gpu_validation) {
         if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) {
             control.emplace(queue);
@@ -3144,6 +3133,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+
+#ifdef ENABLE_GPU_ACCELERATION
+    // Timing for CPU overhead analysis
+    auto tx_loop_start = SteadyClock::now();
+    double sighash_time_ms = 0;
+    double gpu_kernel_time_ms = 0;
+    size_t sighash_count = 0;
+#endif
+
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -3158,8 +3156,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             
 #ifdef ENABLE_GPU_ACCELERATION
             // Use GPU-accelerated UTXO lookups if available
-            if (gpu_enabled && gpu_utxo_set) {
-                LogDebug(BCLog::BENCH, "Using GPU for UTXO lookups for tx %s with %u inputs\n", 
+            if (g_gpu_block_enabled && g_gpu_utxo_set) {
+                LogDebug(BCLog::BENCH, "Using GPU for UTXO lookups for tx %s with %u inputs\n",
                          tx.GetHash().ToString().substr(0, 10), tx.vin.size());
                 // TODO: Implement GPU-accelerated CheckTxInputs
                 // For now, continue with CPU validation
@@ -3352,8 +3350,33 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                 }
                             }
 
+                            // Debug: show precomputed data state before sighash computation
+                            if (gpu_logging) {
+                                fprintf(stderr, "[GPU DEBUG] Before SignatureHashSchnorr: tx=%s input=%zu, sigversion=%d, hashtype=0x%02x\n",
+                                        tx.GetHash().ToString().c_str(), j, (int)cpu_sigversion, nHashType);
+                                fprintf(stderr, "[GPU DEBUG]   m_bip341_taproot_ready=%d, m_spent_outputs_ready=%d, m_bip143_segwit_ready=%d\n",
+                                        txsdata[i].m_bip341_taproot_ready, txsdata[i].m_spent_outputs_ready, txsdata[i].m_bip143_segwit_ready);
+                                fprintf(stderr, "[GPU DEBUG]   annex_init=%d, annex_present=%d, codesep_init=%d, tapleaf_init=%d\n",
+                                        execdata.m_annex_init, execdata.m_annex_present, execdata.m_codeseparator_pos_init, execdata.m_tapleaf_hash_init);
+                                fflush(stderr);
+                            }
+
+                            auto sighash_start = SteadyClock::now();
                             if (SignatureHashSchnorr(sighash, execdata, tx, j, nHashType, cpu_sigversion, txsdata[i], MissingDataBehavior::FAIL)) {
                                 sighash_ptr = sighash.data();
+                                sighash_count++;
+                                sighash_time_ms += Ticks<MillisecondsDouble>(SteadyClock::now() - sighash_start);
+                                if (gpu_logging) {
+                                    fprintf(stderr, "[GPU DEBUG] SignatureHashSchnorr SUCCESS\n");
+                                    fflush(stderr);
+                                }
+                            } else {
+                                if (gpu_logging) {
+                                    fprintf(stderr, "[GPU ERROR] SignatureHashSchnorr FAILED for tx %s input %zu: m_bip341_taproot_ready=%d, m_spent_outputs_ready=%d\n",
+                                              tx.GetHash().ToString().c_str(), j,
+                                              txsdata[i].m_bip341_taproot_ready, txsdata[i].m_spent_outputs_ready);
+                                    fflush(stderr);
+                                }
                             }
                         } else if (cpu_sigversion == SigVersion::WITNESS_V0) {
                             // SegWit v0: signature is in witness stack
@@ -3390,8 +3413,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                 scriptCode = spk;
                             }
 
+                            auto sighash_start = SteadyClock::now();
                             sighash = SignatureHash(scriptCode, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
                             sighash_ptr = sighash.data();
+                            sighash_count++;
+                            sighash_time_ms += Ticks<MillisecondsDouble>(SteadyClock::now() - sighash_start);
+                            if (gpu_logging) {
+                                fprintf(stderr, "[GPU DEBUG] SegWit v0 sighash computed for tx=%s input=%zu, hashtype=0x%02x\n",
+                                        tx.GetHash().ToString().c_str(), j, nHashType);
+                                fflush(stderr);
+                            }
 
                         } else {
                             // Legacy: signature is in scriptSig (first push)
@@ -3402,8 +3433,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                             if (txin.scriptSig.GetOp(pc, opcode, sig) && !sig.empty()) {
                                 nHashType = sig.back();
                             }
+                            auto sighash_start2 = SteadyClock::now();
                             sighash = SignatureHash(coin.out.scriptPubKey, tx, j, nHashType, coin.out.nValue, cpu_sigversion, &txsdata[i]);
                             sighash_ptr = sighash.data();
+                            sighash_count++;
+                            sighash_time_ms += Ticks<MillisecondsDouble>(SteadyClock::now() - sighash_start2);
+                            if (gpu_logging) {
+                                fprintf(stderr, "[GPU DEBUG] Legacy sighash computed for tx=%s input=%zu, hashtype=0x%02x\n",
+                                        tx.GetHash().ToString().c_str(), j, nHashType);
+                                fflush(stderr);
+                            }
                         }
 
                         // Serialize witness data using proper CompactSize encoding
@@ -3435,7 +3474,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                             }
                         }
 
-                        int job_idx = gpu_batch_validator->QueueJob(
+                        int job_idx = g_gpu_block_validator->QueueJob(
                             i,  // tx_index
                             j,  // input_index
                             coin.out.scriptPubKey.data(),
@@ -3506,49 +3545,30 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
         
 #ifdef ENABLE_GPU_ACCELERATION
-        // Update GPU UTXO set to maintain sync with CPU in hybrid mode
-        if (gpu_utxo_set && gpu_utxo_loaded) {
-            // Spend inputs from GPU UTXO set
-            if (!tx.IsCoinBase()) {
-                for (const auto& input : tx.vin) {
-                    gpu_utxo_set->SpendUTXO(input.prevout.hash.ToUint256(), input.prevout.n);
-                }
-            }
-            
-            // Add new outputs to GPU UTXO set
-            for (size_t out = 0; out < tx.vout.size(); out++) {
-                if (!tx.vout[out].IsNull()) {
-                    gpu::UTXOHeader header;
-                    memset(&header, 0, sizeof(header));
-                    header.amount = tx.vout[out].nValue;
-                    header.vout = out;
-                    header.blockHeight = pindex->nHeight;
-                    header.flags = tx.IsCoinBase() ? gpu::UTXO_FLAG_COINBASE : 0;
-                    
-                    const CScript& script = tx.vout[out].scriptPubKey;
-                    header.script_size = script.size();
-                    
-                    // Let GPU's IdentifyScriptType handle script classification
-                    // This is a simple pattern match, much faster than Solver
-                    header.script_type = gpu::IdentifyScriptType(script.data(), script.size());
-                    
-                    gpu_utxo_set->AddUTXO(tx.GetHash().ToUint256(), out, header, script.data());
-                }
-            }
-        }
+        // GPU UTXO updates disabled - too slow (many synchronous cudaMemcpy calls per UTXO)
+        // Even with -gpuutxo=1, we only load initial UTXO set to GPU, not per-block updates.
+        // The GPU uses pre-computed sighashes from CPU, so UTXO updates aren't needed.
+        // TODO: Implement batched async UTXO updates if GPU UTXO lookups are ever needed.
 #endif
     }
 
 #ifdef ENABLE_GPU_ACCELERATION
+    // Debug: Log GPU validation status after transaction loop
+    if (g_gpu_block_validator && g_gpu_block_validator->GetLogging()) {
+        fprintf(stderr, "[GPU DEBUG] After tx loop: gpu_validation_tx_indices.size()=%zu, state.IsValid()=%d\n",
+                gpu_validation_tx_indices.size(), state.IsValid());
+        fflush(stderr);
+    }
+
     // Execute GPU batch validation for queued transactions
-    if (gpu_batch_validator && gpu_validation_enabled && !gpu_validation_tx_indices.empty() && state.IsValid()) {
-        gpu_batch_validator->EndBatch();
+    if (g_gpu_block_validator && g_gpu_block_validation_enabled && !gpu_validation_tx_indices.empty() && state.IsValid()) {
+        g_gpu_block_validator->EndBatch();
 
         LogDebug(BCLog::BENCH, "Executing GPU batch validation for %zu transactions (%zu jobs)\n",
-                 gpu_validation_tx_indices.size(), gpu_batch_validator->GetQueuedJobCount());
+                 gpu_validation_tx_indices.size(), g_gpu_block_validator->GetQueuedJobCount());
 
         auto gpu_start = SteadyClock::now();
-        gpu::BatchValidationResult batch_result = gpu_batch_validator->ValidateBatch();
+        gpu::BatchValidationResult batch_result = g_gpu_block_validator->ValidateBatch();
         auto gpu_end = SteadyClock::now();
 
         LogDebug(BCLog::BENCH, "GPU batch validation: %u valid, %u invalid, %u skipped (%.2fms GPU, %.2fms setup)\n",
@@ -3572,7 +3592,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 case gpu::GPU_SCRIPT_ERR_PUBKEYTYPE: error_str = "SCRIPT_ERR_PUBKEYTYPE"; break;
                 case gpu::GPU_SCRIPT_ERR_SCHNORR_SIG: error_str = "SCRIPT_ERR_SCHNORR_SIG"; break;
                 case gpu::GPU_SCRIPT_ERR_SCHNORR_SIG_SIZE: error_str = "SCRIPT_ERR_SCHNORR_SIG_SIZE"; break;
-                default: break;
+                case gpu::GPU_SCRIPT_ERR_SIG_ECDSA: error_str = "SCRIPT_ERR_SIG_ECDSA"; break;
+                case gpu::GPU_SCRIPT_ERR_UNKNOWN_ERROR: error_str = "GPU_SCRIPT_ERR_UNKNOWN_ERROR"; break;
+                case gpu::GPU_SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH: error_str = "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"; break;
+                case gpu::GPU_SCRIPT_ERR_WITNESS_PUBKEYTYPE: error_str = "SCRIPT_ERR_WITNESS_PUBKEYTYPE"; break;
+                case gpu::GPU_SCRIPT_ERR_SIG_NULLFAIL: error_str = "SCRIPT_ERR_SIG_NULLFAIL"; break;
+                default: error_str = strprintf("GPU_ERROR_%d", (int)batch_result.first_error_code).c_str(); break;
             }
 
             auto debug_str = strprintf("input %u of %s (GPU validated)",
@@ -3594,7 +3619,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
                 // Check if any input for this tx was skipped
                 for (int job_idx : gpu_job_indices[tx_idx]) {
-                    const gpu::ScriptValidationJob* job = gpu_batch_validator->GetJob(job_idx);
+                    const gpu::ScriptValidationJob* job = g_gpu_block_validator->GetJob(job_idx);
                     if (job && !job->validated) {
                         // This job was skipped, need CPU validation
                         all_valid = false;
@@ -3624,7 +3649,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                  gpu_validation_tx_indices.size(),
                  Ticks<MillisecondsDouble>(gpu_end - gpu_start),
                  batch_result.gpu_time_ms / 1000.0);
+        gpu_kernel_time_ms = batch_result.gpu_time_ms;
     }
+
+    // Always print CPU overhead timing so user can see where time is spent
+    auto tx_loop_end = SteadyClock::now();
+    double tx_loop_time_ms = Ticks<MillisecondsDouble>(tx_loop_end - tx_loop_start);
+    double cpu_overhead_ms = tx_loop_time_ms - sighash_time_ms - gpu_kernel_time_ms;
+    fprintf(stderr, "[GPU CPU-OVERHEAD] total=%.2fms | GPU_kernel=%.2fms | CPU_only=%.2fms (sighash=%.2fms, other=%.2fms)\n",
+            tx_loop_time_ms, gpu_kernel_time_ms, cpu_overhead_ms, sighash_time_ms, cpu_overhead_ms - sighash_time_ms);
+    fflush(stderr);
 #endif
 
     const auto time_3{SteadyClock::now()};

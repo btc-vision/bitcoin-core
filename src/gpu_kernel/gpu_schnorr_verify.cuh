@@ -201,6 +201,67 @@ __device__ __host__ inline bool schnorr_verify(
     return schnorr_verify_core(sig, msg, pubkey);
 }
 
+// Schnorr verification with precomputed generator table (FAST)
+__device__ __host__ inline bool schnorr_verify_fast(
+    const uint8_t* sig,
+    const uint8_t* msg,
+    uint32_t msg_len,
+    const uint8_t* pubkey,
+    const GeneratorTable& gen_table)
+{
+    if (msg_len != 32) return false;
+
+    // Parse signature (r, s)
+    FieldElement r;
+    r.SetBytes(sig);  // First 32 bytes
+
+    Scalar s;
+    s.SetBytes(sig + 32);  // Second 32 bytes
+
+    // s must be < n
+    if (scalar_cmp_n(s) >= 0) return false;
+
+    // Parse public key (lift_x)
+    AffinePoint P;
+    if (!pubkey_parse_xonly(P, pubkey)) return false;
+
+    // Compute e = hash(r || P || m)
+    uint8_t e_bytes[32];
+    bip340_challenge_hash(e_bytes, sig, pubkey, msg);
+
+    Scalar e;
+    e.SetBytes(e_bytes);
+    scalar_reduce(e);
+
+    // Compute R = s*G - e*P using precomputed table for G
+    JacobianPoint p_jac;
+    p_jac.FromAffine(P);
+
+    // s*G using precomputed table (FAST!)
+    JacobianPoint sG;
+    ecmult_gen(sG, gen_table, s);
+
+    // e*P
+    JacobianPoint eP;
+    ecmult_simple(eP, p_jac, e);
+
+    // R = s*G - e*P
+    JacobianPoint neg_eP = eP;
+    neg_eP.Negate();
+
+    JacobianPoint R;
+    point_add(R, sG, neg_eP);
+
+    if (R.IsInfinity()) return false;
+
+    AffinePoint R_affine;
+    R.ToAffine(R_affine);
+
+    if (R_affine.y.IsOdd()) return false;
+
+    return R_affine.x.IsEqual(r);
+}
+
 // ============================================================================
 // Batch Schnorr Verification
 // ============================================================================
